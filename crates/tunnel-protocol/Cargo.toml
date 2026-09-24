@@ -1,0 +1,23 @@
+[package]
+name = "tunnel-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Binary frame protocol and handshake for the TLS tunnel"
+
+[dependencies]
+tunnel-common = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "test-util"] }

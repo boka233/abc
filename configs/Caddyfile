@@ -1,0 +1,53 @@
+# 管理面板的反向代理。
+#
+# 由 docker-compose.yml 挂载到 /etc/caddy/Caddyfile。域名与邮箱从 .env 取，
+# docker-deploy.sh 会生成那个文件。
+#
+# 为什么用 Caddy：它自动申请并续期 Let's Encrypt 证书。nginx 要额外装 certbot、
+# 配续期钩子、在续期后 reload —— 那套东西最常见的故障就是钩子没触发导致证书过期。
+
+{
+	# ACME 注册邮箱。证书即将过期或申请失败时 Let's Encrypt 会发信到这里。
+	email {$ACME_EMAIL}
+
+	# 关掉 admin API。它默认只听 localhost，但容器里没有任何东西需要它，
+	# 关掉少一个面。
+	admin off
+}
+
+{$PANEL_DOMAIN} {
+	# 反代到控制面容器。`control` 是 compose 里的服务名，由 Docker 内部 DNS 解析。
+	reverse_proxy control:8080 {
+		# 遥测走 WebSocket。Caddy 的 reverse_proxy 默认就转发 Upgrade 头，
+		# 不需要像 nginx 那样手工设置。
+
+		# 面板的实时数据流是长连接，默认超时会把它掐断。
+		transport http {
+			read_timeout 300s
+		}
+	}
+
+	# --- 安全响应头 ---
+	header {
+		# 一年 HSTS。仅在确认域名长期只走 HTTPS 后才合适 —— 浏览器会记住它，
+		# 期间无法回退到 HTTP。
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# 面板是自托管的单页应用，不加载任何第三方资源。
+		# connect-src 要含 wss: 否则遥测 WebSocket 会被 CSP 拦掉。
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' wss: ws:; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+		# 不暴露服务端软件。
+		-Server
+	}
+
+	# 访问日志。默认输出到容器 stdout，用 docker logs tunnel-proxy 看。
+	log {
+		output stdout
+		format console
+	}
+
+	# gzip/zstd。带遥测的机器列表是大量重复 JSON，压缩收益明显。
+	encode zstd gzip
+}

@@ -1,0 +1,59 @@
+# tunnel-agent configuration
+#
+# Install to /etc/tunnel-agent/config.toml with mode 0600 — this file contains
+# the agent token.
+
+# --- identity, from the panel's "create node" dialog -----------------------
+node_id = "paste-the-node-id-here"
+agent_token = "paste-the-agent-token-here"
+
+# Control plane base URL. Use a private/management address: the built-in client
+# speaks plain HTTP, so put TLS behind a local reverse proxy if this must cross
+# an untrusted network.
+control_url = "http://10.0.0.5:8080"
+
+# Optional local role override. Omit to use the role configured in the panel.
+# Setting it lets an operator demote a node without a panel change.
+#role = "entry"   # entry | exit | both
+
+# --- last-known-good configuration cache ----------------------------------
+# Applied at startup *before* the control plane is contacted, so a reboot during
+# a control-plane outage comes back carrying traffic. Written atomically.
+cache_path = "/var/lib/tunnel-agent/last-known-good.json"
+
+# --- intervals -------------------------------------------------------------
+heartbeat_interval = "10s"
+config_poll_interval = "30s"
+control_timeout = "10s"
+
+# Live connections included in each heartbeat. Bounded so a busy node does not
+# post a huge report; the data plane is unaffected by this number.
+connection_sample_limit = 200
+
+# --- TLS for the tunnel ----------------------------------------------------
+# Private keys stay local and never transit the control plane.
+[tls]
+# Required on an exit; ignored on an entry-only node.
+cert_path = "/etc/tunnel/exit.pem"
+key_path = "/etc/tunnel/exit.key"
+
+# CA used to verify the peer. When set, the system trust store is NOT used —
+# which is what you want for a private CA, since it means no public CA can
+# impersonate your exit.
+ca_path = "/etc/tunnel/ca.pem"
+
+# mTLS. On an exit this demands a client certificate; on an entry it presents one.
+require_client_auth = false
+#client_cert_path = "/etc/tunnel/entry.pem"
+#client_key_path = "/etc/tunnel/entry.key"
+
+# Lab only. Disables certificate verification entirely; the agent logs a warning
+# on every start while this is set.
+insecure_skip_verify = false
+
+# --- logging ---------------------------------------------------------------
+[log]
+level = "info"      # trace | debug | info | warn | error, or an EnvFilter directive
+format = "text"     # text | json  (json for Loki/ELK)
+with_target = true
+with_thread_ids = false

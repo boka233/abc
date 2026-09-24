@@ -1,0 +1,67 @@
+[Unit]
+Description=TLS Tunnel Agent (data plane)
+Documentation=file:///usr/share/doc/tunnel/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tunnel-agent --config /etc/tunnel-agent/config.toml
+# SIGHUP reloads TLS certificates without dropping tunnels.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# SIGTERM triggers the graceful drain: stop accepting, let live streams finish.
+KillSignal=SIGTERM
+# Must exceed the drain window, or systemd SIGKILLs mid-drain and resets every
+# live user connection.
+TimeoutStopSec=45
+
+Restart=always
+RestartSec=3
+
+# --- file descriptors ---
+# Each relayed connection costs two descriptors (client + target) plus the
+# tunnel sockets. The default 1024 caps the node at a few hundred connections.
+# 10k concurrent connections needs >20k; 65535 leaves headroom.
+LimitNOFILE=65535
+
+# --- privileges ---
+# The agent needs no root privileges for the documented setup: binding a source
+# IP requires none, and ports above 1024 are unprivileged.
+User=tunnel
+Group=tunnel
+
+# Uncomment ONLY if a route must bind a privileged port (<1024):
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+#
+# Uncomment ONLY if using egress_interface (SO_BINDTODEVICE). Prefer
+# egress_source_ip, which needs no capability at all — see
+# docs/networking-iepl.md for why.
+# AmbientCapabilities=CAP_NET_RAW
+
+# --- hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The only writable path: the last-known-good configuration cache.
+ReadWritePaths=/var/lib/tunnel-agent
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# --- logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnel-agent
+
+[Install]
+WantedBy=multi-user.target

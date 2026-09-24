@@ -1,0 +1,84 @@
+# 控制面 + 反向代理（自动 HTTPS）。
+#
+# 一键起：./scripts/docker-deploy.sh
+# 手工起：先写好 .env 与 configs/control.docker.toml，再 docker compose up -d
+#
+# 只有控制面跑在容器里。agent 不适合容器化 —— 它要绑定源地址、监听任意端口、读宿主
+# 网卡列表，跑在容器里需要 --network host 加一堆 capability，那时容器已经没有隔离
+# 价值。agent 用 systemd 装在宿主机上，见面板的一键对接命令。
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tunnel-control:local
+    container_name: tunnel-control
+    restart: unless-stopped
+
+    env_file: .env
+    environment:
+      # 反代与控制面在不同容器，对端是容器网段而非回环。不声明它可信的话，
+      # 所有请求的来源都会被算成反代容器的地址，按 IP 的登录限流就退化成
+      # 全局限流：一个人输错密码会把所有人一起锁在门外。
+      TUNNEL_CONTROL_TRUSTED_PROXIES: 172.20.0.0/16
+
+    volumes:
+      # 数据必须持久化：容器一删，数据库与已注册的机器信息全丢。
+      - control-data:/var/lib/tunnel-control
+      # 配置由 docker-deploy.sh 生成。只读挂载 —— 容器没有改它的理由。
+      - ./configs/control.docker.toml:/etc/tunnel-control/config.toml:ro
+
+    # 不对宿主暴露 8080。外部访问一律走反代，避免绕过 TLS 直连明文端口。
+    # 需要本机调试时把下面两行放开。
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+
+    networks:
+      - tunnel
+
+    # 容器内不需要提权：控制面只监听一个高位端口、读写自己的数据目录。
+    security_opt:
+      - no-new-privileges:true
+
+  # Caddy 而不是 nginx：它自动申请并续期 Let's Encrypt 证书，省掉 certbot 与那套
+  # 续期钩子。WebSocket 也不需要额外配置 —— reverse_proxy 默认就转发 Upgrade。
+  proxy:
+    image: caddy:2-alpine
+    container_name: tunnel-proxy
+    restart: unless-stopped
+
+    env_file: .env
+
+    ports:
+      - "80:80"
+      - "443:443"
+      # HTTP/3。UDP 端口，与上面的 443/tcp 不冲突。
+      - "443:443/udp"
+
+    volumes:
+      - ./configs/Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书与 ACME 账号必须持久化：不挂载的话每次重建容器都会重新申请，
+      # 很快撞上 Let's Encrypt 的速率限制（同域名每周 5 次）。
+      - caddy-data:/data
+      - caddy-config:/config
+
+    depends_on:
+      control:
+        condition: service_healthy
+
+    networks:
+      - tunnel
+
+volumes:
+  control-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  tunnel:
+    # 固定网段：控制面的 trusted_proxies 要写死它。用默认网段的话每次
+    # docker network 重建都可能变，那时限流会静默退化。
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

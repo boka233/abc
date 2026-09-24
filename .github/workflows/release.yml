@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'   # 例如 v0.1.0
+  # 允许手工触发，用于验证发布流程本身而不真的打 tag。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建发布包
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release.sh 要读 git sha 写进 BUILD-INFO。
+          fetch-depth: 0
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # ring 与 libsqlite3-sys 含 C 代码，交叉编译到 aarch64 需要目标平台的
+      # C 工具链。装系统交叉编译器比用 cross 快 —— 后者要拉容器镜像。
+      - name: 安装 aarch64 交叉工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      # release.sh 自己会跑 cargo test --workspace；测试不过就不出包。
+      - name: 构建两个架构的发布包
+        run: ./scripts/release.sh --arch both
+
+      - name: 列出产物
+        run: |
+          ls -la dist/
+          echo '--- BUILD-INFO ---'
+          cat dist/*/BUILD-INFO
+
+      # tag 触发时发 Release；手工触发时只上传 artifact 供下载检查。
+      - name: 创建 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          body: |
+            ## 一条命令部署（全新机器）
+
+            ```bash
+            bash <(curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/quick-install.sh)
+            ```
+
+            ## 或用发布包安装
+
+            ```bash
+            tar xzf tunnel-<版本>-<架构>.tar.gz
+            cd tunnel-<版本>-<架构>
+            sha256sum -c SHA256SUMS      # 校验完整性
+            sudo ./install.sh control    # 控制面 + 面板
+            sudo ./install.sh agent      # 仅数据面
+            ```
+
+            包内已含编译好的二进制，目标机器不需要 Rust 或 Node.js。
+            安装控制面时会自动把 agent 二进制放进 `agent_binary_dir`，
+            面板上的一键对接命令随即可用。
+
+            升级顺序与回滚见 `docs/release.md`。
+
+      - name: 上传构建产物（手工触发时）
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages
+          path: dist/*.tar.gz
+          retention-days: 7

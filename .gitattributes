@@ -1,0 +1,49 @@
+# 行尾规范。
+#
+# 为什么需要这个文件：在 Windows 上开发时 core.autocrlf=true 会把签出的文件转成
+# CRLF。对 .rs / .md 无所谓，但对 shell 脚本是致命的 —— Linux 的 bash 会把行尾的
+# \r 当成命令的一部分，报出 `bad interpreter: /usr/bin/env bash^M` 或
+# `$'\r': command not found`，而一键部署脚本恰恰是 curl 下来直接执行的。
+#
+# 下面强制这些文件始终以 LF 存储和签出，与本机 autocrlf 设置无关。
+
+# 默认：让 git 自行判断文本/二进制，文本按 LF 存储。
+* text=auto eol=lf
+
+# 必须是 LF —— 会在 Linux 上执行或被容器读取。
+*.sh        text eol=lf
+*.service   text eol=lf
+Dockerfile  text eol=lf
+Caddyfile   text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.sql       text eol=lf
+
+# 源码与文档统一 LF，避免跨平台协作时产生全文件 diff。
+*.rs        text eol=lf
+*.ts        text eol=lf
+*.vue       text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+
+# 二进制，不做任何行尾转换。
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.woff      binary
+*.woff2     binary
+*.aar       binary
+*.jar       binary
+*.tar.gz    binary
+
+# Cargo.lock 由 cargo 维护，冲突时不要尝试自动合并 —— 应当重新生成。
+Cargo.lock  merge=binary linguist-generated=true
+
+# 前端锁文件同理。
+web/package-lock.json  merge=binary linguist-generated=true
+
+# 语言统计：让 GitHub 把这个仓库识别为 Rust 项目而不是别的。
+web/package-lock.json  linguist-vendored=true

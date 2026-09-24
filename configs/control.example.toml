@@ -1,0 +1,105 @@
+# tunnel-control configuration
+#
+# Install to /etc/tunnel-control/config.toml with mode 0600 — this file contains
+# the session signing key and the tunnel PSK.
+
+# Bind address for the API and admin panel. Bind to localhost and front with a
+# TLS-terminating reverse proxy, or bind a management address directly.
+listen = "127.0.0.1:8080"
+
+database_path = "/var/lib/tunnel-control/control.db"
+
+# Built Vue app. Omit to run API-only.
+web_root = "/usr/share/tunnel-control/web"
+
+# Directory holding the tunnel-agent binaries offered to new machines.
+#
+# The one-line enrolment command fetches the binary from here *before* the agent
+# registers, because at that point the target machine has neither the source nor
+# a Rust toolchain. Expected filenames, exactly:
+#
+#   tunnel-agent-x86_64
+#   tunnel-agent-aarch64
+#
+# The release tarball's install.sh puts the matching binary here automatically.
+# Only the architectures you actually deploy need to be present; a missing one
+# yields a clear "panel offers no binary" message on that machine.
+#
+# NOTE: a top-level field — keep it ABOVE every [table] header (see tunnel_psk).
+agent_binary_dir = "/var/lib/tunnel-control/agent-bin"
+
+# Enables strict startup checks: strong secrets and a pinned CA become mandatory
+# and the process refuses to start without them.
+production = true
+
+# PSK for the tunnel handshake, distributed to every agent. Defence in depth on
+# top of TLS: it still blocks an unauthorised peer if a certificate is
+# mis-issued. At least 32 characters in production.
+#
+#   openssl rand -base64 48
+#
+# NOTE: a top-level field, so it must stay ABOVE every [table] header. Written
+# after [auth] it silently becomes `auth.tunnel_psk`, the real field stays empty,
+# and agents fall back to TLS-only authentication — with no error, because the
+# key is syntactically valid where it landed.
+tunnel_psk = ""
+
+[auth]
+# HMAC key for session tokens. MUST be set in production, and MUST be at least
+# 32 characters. If left empty the control plane generates an ephemeral key and
+# warns — sessions then break on every restart.
+#
+#   openssl rand -base64 48
+jwt_secret = ""
+
+token_ttl = "12h"
+bootstrap_username = "admin"
+
+# Failed logins per IP before lockout. Argon2 verification is deliberately
+# expensive, so this bounds CPU exhaustion as well as credential stuffing.
+login_attempt_limit = 10
+login_lockout = "5m"
+
+[agent]
+# Seconds without a heartbeat before a node shows offline. Must exceed twice the
+# heartbeat interval, or one dropped packet marks a healthy node down.
+stale_after_secs = 45
+heartbeat_interval = "10s"
+
+# Where agents should load their TLS material. Paths only — private keys never
+# transit the control plane.
+[agent_tls]
+ca_path = "/etc/tunnel/ca.pem"
+#cert_path = "/etc/tunnel/exit.pem"
+#key_path = "/etc/tunnel/exit.key"
+require_client_auth = false
+#client_cert_path = "/etc/tunnel/entry.pem"
+#client_key_path = "/etc/tunnel/entry.key"
+
+# Data-plane limits distributed to agents. Every value bounds memory or syscall
+# pressure; see docs/protocol.md before changing them.
+[limits]
+# Both ends must agree. Capped at 65535 by the wire format.
+max_frame_payload = 65536
+# Per-stream receive window. This is the backpressure budget: the sender may not
+# exceed it without a credit update. Must be >= max_frame_payload.
+stream_window = 524288
+# Bounded queues. Unbounded queues are how a relay turns a slow client into an
+# out-of-memory kill.
+tunnel_send_queue = 1024
+stream_recv_queue = 64
+max_streams_per_tunnel = 4096
+max_connections = 20000
+relay_buffer = 16384
+handshake_timeout = "10s"
+connect_timeout = "10s"
+stream_idle_timeout = "300s"
+ping_interval = "15s"
+ping_timeout = "10s"
+ping_max_failures = 3
+
+[log]
+level = "info"
+format = "text"     # "json" for Loki/ELK
+with_target = true
+with_thread_ids = false

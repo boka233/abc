@@ -1,0 +1,49 @@
+[Unit]
+Description=TLS Tunnel Control Plane and Admin Panel
+Documentation=file:///usr/share/doc/tunnel/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tunnel-control --config /etc/tunnel-control/config.toml
+ExecStartPre=/usr/local/bin/tunnel-control --config /etc/tunnel-control/config.toml check
+
+KillSignal=SIGTERM
+# Long enough for background loops to finish a statistics transaction.
+TimeoutStopSec=20
+
+Restart=always
+RestartSec=3
+
+# Only browser sessions and agent polls; far fewer descriptors than the agent.
+LimitNOFILE=8192
+
+User=tunnel
+Group=tunnel
+
+# --- hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# SQLite database plus its WAL/SHM sidecars.
+ReadWritePaths=/var/lib/tunnel-control
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnel-control
+
+[Install]
+WantedBy=multi-user.target

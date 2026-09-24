@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  # 同一分支的新 push 取消旧的运行，省 CI 时间。
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust 测试与检查
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # 注意这里没有 --lib。
+      #
+      # 用 --lib 会跳过没有 lib.rs 的 crate（tunnel-agent 只有 main.rs）以及所有
+      # 集成测试。开发过程中曾因此让 agent 的测试与 tests/end_to_end.rs 长期没被
+      # 编译，里面积压了本该失败的断言 —— 加这条 CI 的直接动因就是防止再次发生。
+      - name: 测试（全部 target）
+        run: cargo test --workspace --all-targets
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 这里刻意**没有** `cargo fmt --check`。
+      #
+      # 现状是全仓库有 170+ 处与 rustfmt 默认风格的差异 —— 这套代码从来没有被
+      # rustfmt 格式化过。把它加进 CI 需要先做一次全仓库重排，那会产生一个跨越
+      # 几乎所有文件的巨大 diff，应当作为独立提交单独审阅。
+      #
+      # 要启用的话：先单独跑一次 `cargo fmt --all` 并单独提交，再放开下面这行。
+      # - run: cargo fmt --all --check
+
+  web:
+    name: 前端类型检查与构建
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+
+      # build 脚本本身就是 vue-tsc --noEmit && vite build，类型错误会让它失败。
+      - name: 构建（含类型检查）
+        run: npm run build
+
+  scripts:
+    name: Shell 脚本检查
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 语法检查
+        run: |
+          for f in scripts/*.sh; do
+            bash -n "$f" || exit 1
+          done
+
+      # shellcheck 暂不阻断构建：开发机上没有它，这些脚本从未被它检查过，
+      # 直接设为阻断很可能在第一次运行时就红。先让它把问题报出来，清完之后
+      # 再去掉 continue-on-error。
+      - name: shellcheck（暂不阻断）
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1091: 不跟踪 source 进来的外部文件（/etc/os-release 等）
+          # SC2016: 文档字符串里故意包含未展开的 $VAR
+          shellcheck -e SC1091,SC2016 scripts/*.sh
+
+  docker:
+    name: Docker 镜像构建
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 只验证镜像能构建成功。不推送 —— 一键部署是在目标机器上本地构建的。
+      - name: 构建镜像
+        run: docker build -t tunnel-control:ci .
+
+      - name: 校验 compose 配置
+        run: |
+          # compose 需要 .env 里的变量，给一份假的即可 —— 这里只验语法。
+          printf 'PANEL_DOMAIN=example.com\nACME_EMAIL=ci@example.com\n' > .env
+          # control.docker.toml 是挂载源，必须存在文件 compose 才肯解析。
+          touch configs/control.docker.toml
+          docker compose config >/dev/null
+          echo "compose 配置有效"

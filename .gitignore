@@ -1,0 +1,38 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# runtime state
+/data
+*.db
+*.db-shm
+*.db-wal
+/certs
+*.pem
+*.key
+*.crt
+
+# web
+web/node_modules
+web/dist
+web/.vite
+web/*.local
+
+# 本机开发目录。含演示用的 jwt_secret / tunnel_psk、SQLite 数据库、日志，
+# 以及放给一键对接下载的 agent 二进制。绝不该进版本库 —— 尤其是公开仓库。
+/.dev
+
+# 规划笔记
+/.narrafork
+
+# local config
+configs/*.local.toml
+.env
+
+# docker-deploy.sh 生成的文件。前者含 jwt_secret 与 tunnel_psk，
+# 后者是 --local 模式的端口映射覆盖。都不该进版本库。
+configs/control.docker.toml
+docker-compose.override.yml
+
+# release.sh 的产物
+/dist

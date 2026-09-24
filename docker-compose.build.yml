@@ -1,0 +1,25 @@
+# 本地构建控制面镜像。
+#
+# 与主 compose 叠加使用：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#
+# docker-deploy.sh 在以下两种情况会自动叠加它：
+#   * 显式传了 --build
+#   * 从 GHCR 拉不到对应版本的镜像（会先打印原因）
+#
+# 为什么单独成文件而不写在主 compose 里：
+#   写在主文件里的话，`docker compose up` 发现镜像不存在会自动开始本地构建 ——
+#   十几分钟、吃 2 GB 内存，而用户只看到一个卡住的进度条。拆出来之后，本地构建
+#   变成一个必须显式选择的动作。
+#
+# 开发时改了 Rust 代码要重建：
+#   ./scripts/docker-deploy.sh --build --rebuild
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 覆盖主文件里的 image：本地构建出来的镜像用这个固定名字，避免与 GHCR 拉下来的
+    # 预构建镜像混淆 —— 两者内容可能不同（本地构建的是当前工作区代码）。
+    image: tunnel-control:local

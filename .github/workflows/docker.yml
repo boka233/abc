@@ -1,0 +1,111 @@
+name: Docker image
+
+# 打 tag 时构建控制面镜像并推到 GHCR，这样部署时不必在服务器上编译。
+#
+# 为什么用 GHCR 而不是 Docker Hub：同一个 GitHub 账号即可推送，用内置的
+# GITHUB_TOKEN 自动鉴权，不需要额外配置密钥。公开仓库的 GHCR 包可匿名拉取。
+on:
+  push:
+    tags:
+      - 'v*'
+  # 手工触发：用于验证构建流程本身，不推送镜像。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: 构建并推送镜像
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 用 QEMU 交叉构建。慢（十几分钟），但这是 CI 的时间，不是用户等待
+      # 部署的时间 —— 后者才是我们要省的。
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 镜像名统一小写：GHCR 不接受大写的仓库名，而 github.repository 会原样保留
+      # 用户名的大小写。
+      - name: 计算镜像名与版本
+        id: meta
+        run: |
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')-control" >> "$GITHUB_OUTPUT"
+          # tag 去掉 v 前缀，与 Cargo.toml 的 version 对齐 —— 部署脚本按那个值
+          # 去拉镜像，两边必须一致。
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 核对 tag 与 Cargo.toml 的版本一致
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # 部署脚本读 Cargo.toml 的版本去拉镜像。若 tag 写成 v0.2.0 而 Cargo.toml
+          # 还是 0.1.0，镜像就会推成 :0.2.0 而脚本去找 :0.1.0 —— 拉不到，静默回落
+          # 本地编译。在这里拦住，比让用户等十几分钟再纳闷便宜得多。
+          cargo_version="$(awk -F'"' '
+              /^\[workspace\.package\]/ { s = 1; next }
+              /^\[/ { s = 0 }
+              s && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)"
+          tag_version="${{ steps.meta.outputs.version }}"
+          echo "Cargo.toml: $cargo_version"
+          echo "tag:        $tag_version"
+          if [[ "$cargo_version" != "$tag_version" ]]; then
+            echo "::error::tag 版本 $tag_version 与 Cargo.toml 的 $cargo_version 不一致。"
+            echo "::error::请先改 Cargo.toml 的 version 并提交，再打对应的 tag。"
+            exit 1
+          fi
+
+      - name: 构建（手工触发时不推送）
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 手工触发只验证 amd64 能否构建。arm64 的 QEMU 构建很慢，
+          # 没必要为一次语法验证等那么久。
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 构建并推送
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # 同时打版本号与 latest。
+          #
+          # 部署脚本**只用版本号那个** —— latest 存在是为了方便手工 docker run，
+          # 脚本若追 latest 会导致「同一条命令在不同时间部署出不同东西」，
+          # 那类问题极难排查。
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出拉取命令
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "镜像已推送："
+          echo "  ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"
+          echo ""
+          echo "注意：GHCR 的包默认是 private，即使仓库是 public。"
+          echo "首次推送后需要到 GitHub 的 Packages 设置里把它改为 Public，"
+          echo "否则部署脚本匿名拉取会失败并回落到本地编译。"

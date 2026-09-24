@@ -9,10 +9,14 @@
 
 services:
   control:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: tunnel-control:local
+    # 镜像由 docker-deploy.sh 决定：
+    #   * 能从 GHCR 拉到对应版本 → 用预构建镜像，跳过编译（几十秒）
+    #   * 拉不到 → 脚本叠加 docker-compose.build.yml 在本地构建（十几分钟）
+    #
+    # 这里刻意**不写 build:**。写了的话 `docker compose up` 在镜像不存在时会
+    # 自动本地构建，而那正是我们要避免的默认行为 —— 用户会莫名等十几分钟却不知道
+    # 为什么。要本地构建必须显式叠加 build 文件。
+    image: ${TUNNEL_IMAGE:-tunnel-control:local}
     container_name: tunnel-control
     restart: unless-stopped
 

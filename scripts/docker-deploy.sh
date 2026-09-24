@@ -52,7 +52,12 @@ usage() {
       --destroy          停止并删除数据卷（不可恢复）
       --logs             跟踪日志
       --rebuild          重新构建镜像后重启
+      --build            强制本地构建，不拉取预构建镜像
+      --image <镜像>     使用指定镜像，如 ghcr.io/user/repo-control:0.1.0
       --help             显示本帮助
+
+默认行为：优先从 GHCR 拉取与仓库版本对应的预构建镜像（几十秒）；拉不到时会
+打印原因并回落到本地构建（十几分钟，需约 2 GB 内存）。
 
 首次运行不带参数时会交互式询问域名与邮箱。
 EOF
@@ -65,6 +70,8 @@ DOMAIN=""
 EMAIL=""
 MODE="up"
 LOCAL_ONLY="no"
+FORCE_BUILD="no"
+FORCED_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -75,6 +82,8 @@ while [[ $# -gt 0 ]]; do
         --destroy) MODE="destroy"; shift ;;
         --logs) MODE="logs"; shift ;;
         --rebuild) MODE="rebuild"; shift ;;
+        --build) FORCE_BUILD="yes"; shift ;;
+        --image) FORCED_IMAGE="${2:-}"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         *) usage; die "未知参数：$1" ;;
     esac
@@ -111,8 +120,42 @@ ensure_docker() {
   apt install docker-compose-plugin"
 }
 
+# compose 调用。COMPOSE_FILES 由镜像决策阶段填充：用预构建镜像时只有主文件，
+# 本地构建时叠加 docker-compose.build.yml。
+COMPOSE_FILES=(-f docker-compose.yml)
+
 compose() {
-    ( cd "$REPO_ROOT" && docker compose "$@" )
+    ( cd "$REPO_ROOT" && docker compose "${COMPOSE_FILES[@]}" "$@" )
+}
+
+# ---------------------------------------------------------------------------
+# 版本与镜像
+# ---------------------------------------------------------------------------
+# 从 Cargo.toml 取版本号。只有这一个来源 —— 镜像 tag、发布包名、二进制的
+# --version 全都从它派生。
+read_version() {
+    awk -F'"' '
+        /^\[workspace\.package\]/ { s = 1; next }
+        /^\[/ { s = 0 }
+        s && /^version[[:space:]]*=/ { print $2; exit }
+    ' "$REPO_ROOT/Cargo.toml"
+}
+
+# 从 git remote 推出 GHCR 镜像名与 GitHub owner/repo。
+#
+# 不写死仓库地址：fork 之后镜像应当指向 fork 自己的 GHCR，而不是上游的。
+detect_repo_slug() {
+    local url
+    url="$(cd "$REPO_ROOT" && git config --get remote.origin.url 2>/dev/null || true)"
+    [[ -n "$url" ]] || return 1
+    # 同时处理 https://github.com/a/b.git 与 git@github.com:a/b.git
+    url="${url%.git}"
+    url="${url#*github.com[:/]}"
+    # 去掉可能残留的协议前缀
+    url="${url#https://github.com/}"
+    url="${url#git@github.com:}"
+    [[ "$url" == */* ]] || return 1
+    printf '%s' "$url"
 }
 
 # ---------------------------------------------------------------------------
@@ -325,15 +368,75 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 构建并启动
+# 决定用预构建镜像还是本地构建
 # ---------------------------------------------------------------------------
-step "构建镜像"
-if [[ "$MODE" == "rebuild" ]]; then
-    compose build --no-cache || die "镜像构建失败"
+# 在服务器上编译整套 Rust 要十几分钟、吃 2 GB 内存、小内存机器还可能被 OOM 干掉 ——
+# 而每台机器编出来的东西完全一样。能拉到预构建镜像就不该重复这件事。
+#
+# 回落到本地构建时必须**打印原因**。静默回落会让人莫名等十几分钟还不知道为什么，
+# 那比直接失败更难排查。
+step "确定控制面镜像"
+
+VERSION="$(read_version)"
+[[ -n "$VERSION" ]] || die "无法从 Cargo.toml 读出版本号"
+info "仓库版本 $VERSION"
+
+USE_PREBUILT="no"
+
+if [[ -n "$FORCED_IMAGE" ]]; then
+    TUNNEL_IMAGE="$FORCED_IMAGE"
+    info "使用指定镜像 $TUNNEL_IMAGE"
+    if docker pull "$TUNNEL_IMAGE" 2>&1 | tail -2; then
+        USE_PREBUILT="yes"
+        ok "镜像已拉取"
+    else
+        die "无法拉取指定的镜像 $TUNNEL_IMAGE"
+    fi
+elif [[ "$FORCE_BUILD" == "yes" ]]; then
+    info "已指定 --build，跳过拉取，直接本地构建"
 else
-    compose build || die "镜像构建失败"
+    SLUG="$(detect_repo_slug || true)"
+    if [[ -z "$SLUG" ]]; then
+        warn "无法从 git remote 推出仓库名，改为本地构建"
+    else
+        # GHCR 不接受大写仓库名，而 GitHub 用户名可能含大写。
+        IMAGE_BASE="ghcr.io/$(printf '%s' "$SLUG" | tr 'A-Z' 'a-z')-control"
+        CANDIDATE="$IMAGE_BASE:$VERSION"
+        info "尝试拉取 $CANDIDATE"
+
+        # 不丢 stderr：拉取失败的原因（包是 private、tag 不存在、网络不通）
+        # 需要让用户看到，否则只会得到一句「改为本地构建」。
+        if docker pull "$CANDIDATE" 2>&1 | tail -3; then
+            TUNNEL_IMAGE="$CANDIDATE"
+            USE_PREBUILT="yes"
+            ok "已拉取预构建镜像，跳过编译"
+        else
+            warn "拉取 $CANDIDATE 失败，将在本地构建。常见原因："
+            warn "  1. 还没有发布过这个版本 —— 需要先 git tag v$VERSION && git push --tags"
+            warn "  2. GHCR 的包默认是 private（即使仓库是 public）——"
+            warn "     到 GitHub 的 Packages 设置里把它改为 Public"
+            warn "  3. 本机网络无法访问 ghcr.io"
+            info "本地构建约需十几分钟，且需要约 2 GB 内存。"
+        fi
+    fi
 fi
-ok "镜像就绪"
+
+if [[ "$USE_PREBUILT" == "yes" ]]; then
+    export TUNNEL_IMAGE
+    ok "将使用镜像 $TUNNEL_IMAGE"
+else
+    # 叠加 build 文件。主 compose 刻意不含 build:，所以必须显式加上它才会本地构建。
+    COMPOSE_FILES+=(-f docker-compose.build.yml)
+    export TUNNEL_IMAGE="tunnel-control:local"
+
+    step "本地构建镜像"
+    if [[ "$MODE" == "rebuild" ]]; then
+        compose build --no-cache control || die "镜像构建失败"
+    else
+        compose build control || die "镜像构建失败"
+    fi
+    ok "镜像构建完成"
+fi
 
 step "启动服务"
 if [[ "$LOCAL_ONLY" == "yes" ]]; then
@@ -355,8 +458,12 @@ done
 # ---------------------------------------------------------------------------
 # 放置 agent 二进制
 # ---------------------------------------------------------------------------
-# 一键对接要从面板下载 agent 二进制。控制面镜像里没有它（镜像只装控制面），
-# 所以从构建阶段拷一份出来放进数据卷。
+# 一键对接要从面板下载 agent 二进制，而控制面镜像里没有它（镜像只装控制面）。
+#
+# 取二进制的顺序，按代价从低到高：
+#   1. GitHub Release 的预编译文件（几秒，带 sha256 校验）
+#   2. 本机 target/release（开发机上已经编过）
+#   3. Docker build 阶段（十几分钟，最后手段）
 step "放置 agent 二进制供一键对接使用"
 
 ARCH="$(uname -m)"
@@ -366,39 +473,90 @@ case "$ARCH" in
     *) ASSET_ARCH="" ;;
 esac
 
+readonly AGENT_DEST="/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH"
+
+# 从 Release 下载并校验。成功返回 0。
+download_agent_from_release() {
+    local slug="$1" version="$2" arch="$3" out="$4"
+    local base="https://github.com/$slug/releases/download/v$version"
+    local bin_url="$base/tunnel-agent-$arch"
+    local sha_url="$base/tunnel-agent-$arch.sha256"
+
+    info "尝试从 Release 下载 tunnel-agent-$arch"
+    curl -fsSL --connect-timeout 10 --max-time 300 -o "$out" "$bin_url" 2>/dev/null \
+        || return 1
+    [[ -s "$out" ]] || return 1
+
+    # 校验。下载的是要以 root 权限运行的可执行文件，不校验等于接受链路上任何一跳
+    # 的替换。拿不到校验值时也不放行 —— 宁可回落到本地构建。
+    local expected actual
+    expected="$(curl -fsSL --connect-timeout 10 "$sha_url" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -z "$expected" ]]; then
+        warn "Release 里没有 tunnel-agent-$arch.sha256，无法校验，放弃这个来源"
+        return 1
+    fi
+    actual="$(sha256sum "$out" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+        warn "下载的 agent 二进制校验失败，已丢弃"
+        warn "  声明 $expected"
+        warn "  实际 $actual"
+        return 1
+    fi
+    ok "已下载并校验 tunnel-agent-$arch（sha256 ${actual:0:16}…）"
+    return 0
+}
+
+place_agent() {
+    docker cp "$1" "tunnel-control:$AGENT_DEST"
+}
+
 if [[ -z "$ASSET_ARCH" ]]; then
     warn "未知架构 $ARCH，跳过 agent 二进制放置"
-elif [[ -x "$REPO_ROOT/target/release/tunnel-agent" ]]; then
-    docker cp "$REPO_ROOT/target/release/tunnel-agent" \
-        "tunnel-control:/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH" \
-        && ok "已放置 tunnel-agent-$ASSET_ARCH（来自本机 target/release）"
 else
-    # 从构建镜像里取。Dockerfile 的 build 阶段同时编了 control 与 agent，
-    # 就是为了这一步。
-    info "本机没有已编译的 agent，从构建镜像中提取…"
-    # 不丢 stderr：上一版把它丢了，于是构建失败时只显示一句「跳过」，
-    # 真正的原因（比如依赖 MSRV 超出基础镜像）完全看不到。
-    if docker build --target build -t tunnel-build:local "$REPO_ROOT"; then
-        cid="$(docker create tunnel-build:local)"
-        if docker cp "$cid:/src/target/release/tunnel-agent" /tmp/tunnel-agent; then
-            docker cp /tmp/tunnel-agent \
-                "tunnel-control:/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH"
-            rm -f /tmp/tunnel-agent
-            ok "已放置 tunnel-agent-$ASSET_ARCH"
-        else
-            warn "无法从构建镜像提取 agent 二进制"
-        fi
-        docker rm -f "$cid" >/dev/null 2>&1 || true
-    else
-        warn "构建阶段镜像失败，见上方输出"
+    TMP_AGENT="$(mktemp)"
+    PLACED="no"
+
+    # --- 1. Release ---
+    SLUG="${SLUG:-$(detect_repo_slug || true)}"
+    if [[ -n "$SLUG" ]] \
+        && download_agent_from_release "$SLUG" "$VERSION" "$ASSET_ARCH" "$TMP_AGENT"; then
+        place_agent "$TMP_AGENT" && PLACED="yes"
     fi
+
+    # --- 2. 本机已编译的 ---
+    if [[ "$PLACED" == "no" && -x "$REPO_ROOT/target/release/tunnel-agent" ]]; then
+        info "改用本机 target/release/tunnel-agent"
+        place_agent "$REPO_ROOT/target/release/tunnel-agent" && PLACED="yes"
+    fi
+
+    # --- 3. Docker build 阶段 ---
+    if [[ "$PLACED" == "no" ]]; then
+        info "改从 Docker 构建阶段提取（较慢）…"
+        # 不丢 stderr：构建失败的真正原因（比如依赖 MSRV 超出基础镜像）
+        # 必须让用户看到，否则只会得到一句「跳过」。
+        if docker build --target build -t tunnel-build:local "$REPO_ROOT"; then
+            cid="$(docker create tunnel-build:local)"
+            if docker cp "$cid:/src/target/release/tunnel-agent" "$TMP_AGENT"; then
+                place_agent "$TMP_AGENT" && PLACED="yes"
+            else
+                warn "无法从构建镜像提取 agent 二进制"
+            fi
+            docker rm -f "$cid" >/dev/null 2>&1 || true
+        else
+            warn "构建阶段镜像失败，见上方输出"
+        fi
+    fi
+
+    rm -f "$TMP_AGENT"
+    [[ "$PLACED" == "yes" ]] && ok "已放置 $AGENT_DEST"
 fi
 
-if ! docker exec tunnel-control ls "/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH" \
-        >/dev/null 2>&1; then
+if ! docker exec tunnel-control ls "$AGENT_DEST" >/dev/null 2>&1; then
     warn "agent 二进制未就位 —— 面板上的一键对接命令会报「面板未提供二进制」。"
-    warn "可手工放置："
-    warn "  docker cp tunnel-agent tunnel-control:/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH"
+    warn "最省事的补法：发一个版本，之后脚本会直接从 Release 下载。"
+    warn "  git tag v$VERSION && git push --tags"
+    warn "或手工放置已有的二进制："
+    warn "  docker cp tunnel-agent tunnel-control:$AGENT_DEST"
 fi
 
 # ---------------------------------------------------------------------------

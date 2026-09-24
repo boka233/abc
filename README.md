@@ -16,9 +16,14 @@ On a fresh Ubuntu/Debian host, as root:
 bash <(curl -fsSL https://raw.githubusercontent.com/boka233/abc/main/scripts/quick-install.sh)
 ```
 
-It asks for a domain and an email, then installs Docker, builds the images, and
-brings up the control plane behind a reverse proxy with automatic HTTPS. The
-first-login password is printed at the end.
+It asks for a domain and an email, then installs Docker, pulls the prebuilt
+image, and brings up the control plane behind a reverse proxy with automatic
+HTTPS. The first-login password is printed at the end.
+
+Nothing is compiled on the target host — the control-plane image comes from GHCR
+and the agent binary from the release assets. That needs a published version
+(`git tag v0.1.0 && git push --tags`); without one the script says so and falls
+back to building locally, which takes ~15 minutes and about 2 GB of RAM.
 
 Non-interactive:
 

@@ -116,5 +116,20 @@ jobs:
           printf 'PANEL_DOMAIN=example.com\nACME_EMAIL=ci@example.com\n' > .env
           # control.docker.toml 是挂载源，必须存在文件 compose 才肯解析。
           touch configs/control.docker.toml
-          docker compose config >/dev/null
-          echo "compose 配置有效"
+
+          # 主文件：部署时用预构建镜像的形态。
+          docker compose -f docker-compose.yml config >/dev/null
+          echo "主 compose 配置有效"
+
+          # 叠加 build 文件：本地构建的形态。两种组合都要能解析，否则回落路径
+          # 会在用户最需要它的时候失败。
+          docker compose -f docker-compose.yml -f docker-compose.build.yml config >/dev/null
+          echo "叠加 build 文件后仍然有效"
+
+          # 主文件不该含 build:，否则 `docker compose up` 会在镜像缺失时
+          # 静默开始十几分钟的本地编译 —— 那正是要避免的默认行为。
+          if docker compose -f docker-compose.yml config | grep -qE '^\s+build:'; then
+            echo "::error::docker-compose.yml 不应包含 build:，它属于 docker-compose.build.yml"
+            exit 1
+          fi
+          echo "主 compose 确认不含 build:"

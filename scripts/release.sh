@@ -250,6 +250,21 @@ build_for_arch() {
     # --- 打包 ---
     ( cd "$DIST_DIR" && tar czf "$name.tar.gz" "$name" )
     ok "产出 dist/$name.tar.gz（$(du -h "$DIST_DIR/$name.tar.gz" | awk '{print $1}')）"
+
+    # --- 裸二进制，直接放在 dist/ 顶层 ---
+    #
+    # 为什么除了 tar 包还要单独放：一键部署脚本只需要 agent 一个文件（十几 MB），
+    # 让它下载整个包再解开是浪费；而控制面所在机器也可能只想换一个二进制而不动
+    # 配置。Release 页面直接挂这些文件，curl 一条就能取。
+    #
+    # sha256 各自成文件而不只依赖包内的 SHA256SUMS：脚本取单个文件时没有包上下文，
+    # 需要一个能独立 curl 到的校验值。下载的是要以 root 运行的可执行文件，
+    # 不校验等于接受链路上任何一跳的替换。
+    for bin in tunnel-control tunnel-agent; do
+        install -m 755 "$bin_dir/$bin" "$DIST_DIR/$bin-$arch"
+        ( cd "$DIST_DIR" && sha256sum "$bin-$arch" | awk '{print $1}' > "$bin-$arch.sha256" )
+    done
+    ok "产出裸二进制 tunnel-control-$arch / tunnel-agent-$arch（含 .sha256）"
 }
 
 mkdir -p "$DIST_DIR"
@@ -264,6 +279,8 @@ printf '\n%s================ 发布包已就绪 ================%s\n' "$C_BOLD" 
 printf '\n版本 %s（%s）\n\n' "$VERSION" "$GIT_SHA"
 for arch in "${TARGET_ARCHES[@]}"; do
     printf '  dist/tunnel-%s-%s.tar.gz\n' "$VERSION" "$arch"
+    printf '  dist/tunnel-control-%s（+ .sha256）\n' "$arch"
+    printf '  dist/tunnel-agent-%s（+ .sha256）\n' "$arch"
 done
 
 cat <<EOF

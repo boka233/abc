@@ -9,6 +9,51 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boka233/abc/main/scripts/qui
 `quick-install.sh` 是引导脚本,只做三件事:检查环境(系统、架构、内存、磁盘)、克隆
 仓库到 `/opt/tunnel`、然后 `exec` 到 `scripts/docker-deploy.sh`。
 
+## 不在服务器上编译
+
+部署默认**拉取预编译产物**,不在目标机器上编译:
+
+| 东西 | 来源 | 耗时 |
+|---|---|---|
+| 控制面镜像 | `ghcr.io/<你的仓库>-control:<版本>` | 几十秒 |
+| agent 二进制 | GitHub Release 的 `tunnel-agent-<arch>` | 几秒 |
+
+在服务器上编译要十几分钟、吃 2 GB 内存、小内存机器还可能被 OOM 干掉 —— 而每台机器
+编出来的东西完全一样。CI 编一次就够。
+
+**前提是你先发过一个版本:**
+
+```bash
+git tag v0.1.0 && git push --tags
+```
+
+这会触发两个 workflow:`release.yml` 产出发布包与裸二进制,`docker.yml` 构建
+amd64/arm64 镜像推到 GHCR。
+
+### 拉不到时会回落本地构建,并打印原因
+
+回落是显式的,不会静默让你等十几分钟。常见原因:
+
+1. **还没发布过这个版本** —— 打个 tag 就好
+2. **GHCR 包是 private** —— 即使仓库是 public,GHCR 的包默认仍是 private。首次推送
+   后要到 GitHub 的 Packages 设置里改成 Public,否则匿名拉取会 401
+3. **网络不通 ghcr.io**
+
+想强制本地构建(改了代码要验证)或指定镜像:
+
+```bash
+./scripts/docker-deploy.sh --build                    # 强制本地构建
+./scripts/docker-deploy.sh --image ghcr.io/xx/yy:0.1.0  # 用指定镜像
+```
+
+### 镜像 tag 与代码版本必须对应
+
+脚本读 `Cargo.toml` 的 version 去拉对应 tag 的镜像,**不追 `latest`**。追 latest 会
+导致「同一条命令在不同时间部署出不同东西」,那类问题极难排查。
+
+`docker.yml` 里有一步会核对 git tag 与 `Cargo.toml` 的版本是否一致,不一致直接让
+CI 失败 —— 否则镜像会推成 `:0.2.0` 而脚本去找 `:0.1.0`,拉不到后静默回落编译。
+
 部署逻辑刻意**不写在引导脚本里**。那个脚本会被 curl 到陌生机器上执行,应当短到能
 读完;真正的逻辑放在仓库里,可以被审阅、被 git 追溯,而不是一段一次性的管道输入。
 

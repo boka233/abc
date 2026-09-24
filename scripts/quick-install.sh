@@ -66,6 +66,12 @@ while [[ $# -gt 0 ]]; do
         --help|-h) usage; exit 0 ;;
         -d|--domain|-e|--email)
             PASSTHROUGH+=("$1" "${2:-}"); shift 2 ;;
+        # 跳过空串。
+        #
+        # 命令行里 `\` 后面多一个空格再换行，shell 会传进来一个空参数。原先它被
+        # 原样转发给 docker-deploy.sh，在那边落到「未知参数」分支上，而且参数名
+        # 是空的 —— 报错看起来像脚本坏了，实际只是一个多余的空格。
+        "") shift ;;
         *) PASSTHROUGH+=("$1"); shift ;;
     esac
 done

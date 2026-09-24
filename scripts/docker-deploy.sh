@@ -85,6 +85,9 @@ while [[ $# -gt 0 ]]; do
         --build) FORCE_BUILD="yes"; shift ;;
         --image) FORCED_IMAGE="${2:-}"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
+        # 忽略空参数。命令行续行符后多一个空格就会产生一个，直接报「未知参数」
+        # 对使用者毫无帮助 —— 错误信息里那个参数名还是空的。
+        "") shift ;;
         *) usage; die "未知参数：$1" ;;
     esac
 done

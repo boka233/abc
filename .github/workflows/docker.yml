@@ -160,15 +160,27 @@ jobs:
         run: |
           IMAGE='${{ steps.meta.outputs.image }}'
           VERSION='${{ steps.meta.outputs.version }}'
+
+          # 人类可读的形式，失败时这段输出就是排查依据。
           docker buildx imagetools inspect "$IMAGE:$VERSION"
 
-          arches="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --raw \
-            | grep -oE '"architecture":"[a-z0-9]+"' | sort -u)"
-          echo "$arches"
-          echo "$arches" | grep -q '"architecture":"amd64"' \
-            || { echo "::error::manifest 缺少 amd64"; exit 1; }
-          echo "$arches" | grep -q '"architecture":"arm64"' \
-            || { echo "::error::manifest 缺少 arm64"; exit 1; }
+          # 从可读输出里提取平台，而不是解析 --raw 的 JSON。
+          #
+          # 上一版按 `"architecture":"amd64"` 去 grep --raw 的输出，但 --raw 返回的是
+          # 格式化过的 JSON，字段写作 `"architecture": "amd64"`（冒号后有空格），
+          # 于是模式匹配不上 —— 两个架构其实都推成功了，却报「缺少 amd64」。
+          #
+          # `inspect` 的默认输出里每个平台是一行 `Platform:  linux/amd64`，形状稳定
+          # 且与 JSON 缩进无关。
+          platforms="$(docker buildx imagetools inspect "$IMAGE:$VERSION" \
+            | awk '/^ *Platform:/ { print $2 }' | sort -u)"
+          echo "manifest 中的平台：" $platforms
+
+          for want in linux/amd64 linux/arm64; do
+            printf '%s\n' "$platforms" | grep -qx "$want" \
+              || { echo "::error::manifest 缺少 $want"; exit 1; }
+          done
+          echo "两个架构均在 manifest 中"
 
       - name: 输出拉取命令
         run: |

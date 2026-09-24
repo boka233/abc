@@ -4,6 +4,13 @@ name: Docker image
 #
 # 为什么用 GHCR 而不是 Docker Hub：同一个 GitHub 账号即可推送，用内置的
 # GITHUB_TOKEN 自动鉴权，不需要额外配置密钥。公开仓库的 GHCR 包可匿名拉取。
+#
+# 两个架构各自在原生 runner 上编译 —— 不用 QEMU。
+#
+# 起初用的是「一台 amd64 机器 + QEMU 同时编两个平台」，结果 arm64 走指令级模拟慢
+# 10-20 倍，整个 workflow 要 30 分钟。GitHub 现在免费提供原生 ARM runner
+# （ubuntu-24.04-arm），arm64 在真 ARM CPU 上编译和 amd64 一样快；配合 matrix
+# 并行，总耗时取较慢的那个而不是两者相加。
 on:
   push:
     tags:
@@ -15,18 +22,33 @@ permissions:
   contents: read
   packages: write
 
+# 同一个 tag 重新推送时取消上一次运行。
+#
+# 没有这个的话，`git tag -d` + 重推会留下一个仍在跑的旧运行 —— 它编的是过时代码，
+# 却和新运行抢 runner 配额，两边都变慢。
+#
+# 用 ref 而不是 sha 作分组键：重推同名 tag 时 ref 不变，才能命中并取消旧运行。
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  image:
-    name: 构建并推送镜像
-    runs-on: ubuntu-latest
+  build:
+    name: 构建 ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      # 一个架构失败时让另一个跑完 —— 便于判断是平台相关问题还是普遍问题。
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm    # GitHub 提供的原生 ARM runner
+            arch: arm64
 
     steps:
       - uses: actions/checkout@v4
-
-      # arm64 用 QEMU 交叉构建。慢（十几分钟），但这是 CI 的时间，不是用户等待
-      # 部署的时间 —— 后者才是我们要省的。
-      - name: 设置 QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: 设置 Buildx
         uses: docker/setup-buildx-action@v3
@@ -54,8 +76,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           # 部署脚本读 Cargo.toml 的版本去拉镜像。若 tag 写成 v0.2.0 而 Cargo.toml
-          # 还是 0.1.0，镜像就会推成 :0.2.0 而脚本去找 :0.1.0 —— 拉不到，静默回落
-          # 本地编译。在这里拦住，比让用户等十几分钟再纳闷便宜得多。
+          # 还是 0.1.0，镜像就会推成 :0.2.0 而脚本去找 :0.1.0 —— 拉不到，回落本地
+          # 编译。在这里拦住，比让用户等十几分钟再纳闷便宜得多。
           cargo_version="$(awk -F'"' '
               /^\[workspace\.package\]/ { s = 1; next }
               /^\[/ { s = 0 }
@@ -75,33 +97,80 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          # 手工触发只验证 amd64 能否构建。arm64 的 QEMU 构建很慢，
-          # 没必要为一次语法验证等那么久。
-          platforms: linux/amd64
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 缓存按架构分 scope。gha 后端默认所有构建共用一个 scope，两个架构会
+          # 互相覆盖对方的 BuildKit 缓存，结果每次都是全量重编。
+          cache-from: type=gha,scope=control-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=control-${{ matrix.arch }}
 
-      - name: 构建并推送
+      - name: 构建并推送（带架构后缀）
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
           push: true
-          # 同时打版本号与 latest。
+          # 先各自推带架构后缀的单平台镜像，再由 manifest job 合并。
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}
+          # provenance:false 让每次推送保持为纯单平台镜像。
           #
-          # 部署脚本**只用版本号那个** —— latest 存在是为了方便手工 docker run，
-          # 脚本若追 latest 会导致「同一条命令在不同时间部署出不同东西」，
-          # 那类问题极难排查。
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
-            ${{ steps.meta.outputs.image }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 默认开启时每次推送会变成一个 OCI index，里面多一条 unknown/unknown 的
+          # attestation 条目；后面 imagetools create 合并时会把它一起拷进多架构
+          # manifest，让 manifest 变得杂乱，扫描工具也会困惑。
+          provenance: false
+          cache-from: type=gha,scope=control-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=control-${{ matrix.arch }}
+
+  manifest:
+    name: 合并多架构 manifest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像名与版本
+        id: meta
+        run: |
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')-control" >> "$GITHUB_OUTPUT"
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # 把两个单架构镜像合成一个多架构 manifest。
+      #
+      # 这样 `docker pull <镜像>:<版本>` 在 x86 与 ARM 机器上都能自动取到正确的那份，
+      # 部署脚本不需要关心架构。
+      - name: 合并
+        run: |
+          IMAGE='${{ steps.meta.outputs.image }}'
+          VERSION='${{ steps.meta.outputs.version }}'
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            "$IMAGE:$VERSION-amd64" \
+            "$IMAGE:$VERSION-arm64"
+
+      # 合并完立刻验证，而不是等部署时才发现 manifest 是坏的。
+      - name: 验证 manifest 含两个架构
+        run: |
+          IMAGE='${{ steps.meta.outputs.image }}'
+          VERSION='${{ steps.meta.outputs.version }}'
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+          arches="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --raw \
+            | grep -oE '"architecture":"[a-z0-9]+"' | sort -u)"
+          echo "$arches"
+          echo "$arches" | grep -q '"architecture":"amd64"' \
+            || { echo "::error::manifest 缺少 amd64"; exit 1; }
+          echo "$arches" | grep -q '"architecture":"arm64"' \
+            || { echo "::error::manifest 缺少 arm64"; exit 1; }
 
       - name: 输出拉取命令
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           echo "镜像已推送："
           echo "  ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"

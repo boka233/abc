@@ -411,12 +411,37 @@ else
             USE_PREBUILT="yes"
             ok "已拉取预构建镜像，跳过编译"
         else
-            warn "拉取 $CANDIDATE 失败，将在本地构建。常见原因："
+            warn "拉取 $CANDIDATE 失败。常见原因："
             warn "  1. 还没有发布过这个版本 —— 需要先 git tag v$VERSION && git push --tags"
             warn "  2. GHCR 的包默认是 private（即使仓库是 public）——"
             warn "     到 GitHub 的 Packages 设置里把它改为 Public"
             warn "  3. 本机网络无法访问 ghcr.io"
-            info "本地构建约需十几分钟，且需要约 2 GB 内存。"
+
+            # 不再静默回落。
+            #
+            # 之前这里直接开始本地构建，用户看到的是一个卡住十几分钟的进度条，
+            # 而真正该做的往往只是「等 CI 编完」或「把 GHCR 包改成 Public」——
+            # 那两件事都比在服务器上重复编译一遍便宜得多。
+            printf '\n'
+            warn "本地构建约需十几分钟，且需要约 2 GB 内存（小内存机器可能被 OOM 中断）。"
+            info "更快的做法：等 CI 把镜像编好（约 5-8 分钟），再重跑本脚本。"
+            printf '\n'
+
+            if [[ -t 0 ]]; then
+                read -r -p "现在就在本机编译？[y/N] " build_now
+                if [[ "$build_now" != "y" && "$build_now" != "Y" ]]; then
+                    info "已取消。镜像就绪后重跑本脚本，或用 --build 强制本地编译。"
+                    exit 0
+                fi
+            else
+                # 非交互（CI、curl 管道）下不擅自花十几分钟。要本地构建就显式传
+                # --build，这样意图明确。
+                die "没有可用的预构建镜像，已停止。
+
+等 CI 编好镜像后重跑本脚本即可（推荐）。
+确认要在本机编译十几分钟，请显式加 --build：
+  $0 --build $*"
+            fi
         fi
     fi
 fi

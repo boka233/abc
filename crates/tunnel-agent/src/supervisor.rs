@@ -750,6 +750,22 @@ mod tests {
         port
     }
 
+    /// 等到端口可连接，或超时。
+    ///
+    /// `apply()` 里监听器是 spawn 起来的，函数返回不代表已经 bind 上。用轮询而不是
+    /// 固定 sleep：固定时长总有一天会在更慢的机器上不够，而这里超时仍然返回 false，
+    /// 所以监听器真的起不来时测试照样会失败，不会把问题掩盖过去。
+    async fn wait_until_listening(port: u16, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     /// 直连模式的 bundle，转发到给定的目标列表。
     fn direct_bundle(
         revision: u64,
@@ -779,11 +795,11 @@ mod tests {
         assert_eq!(sup.route_count().await, 1);
         assert_eq!(sup.applied_revision(), 1);
 
-        // The listener is really bound.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // 监听器真的 bind 上了。200ms 的固定等待在负载高的 CI 机器上不一定够，
+        // 改成轮询。
         assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
-            "route listener is not accepting"
+            wait_until_listening(port, Duration::from_secs(5)).await,
+            "线路监听器没有开始接受连接"
         );
 
         sup.shutdown().await;
@@ -830,8 +846,19 @@ mod tests {
             "a rejected bundle must not be cached"
         );
 
-        // Still serving.
-        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok());
+        // 仍在服务。
+        //
+        // 必须等监听器真的 bind 上：apply() 里监听器是 tokio::spawn 起来的，
+        // 函数返回时 bind 可能还没完成。原先这里直接 connect，在 Windows 上恰好
+        // 赶上、在 Linux CI 上赶不上 —— 这是个一直存在的竞态，只是平台差异让它
+        // 只在一边暴露。
+        //
+        // 用有上限的轮询而不是固定 sleep：固定时长在更慢的机器上还会再坏一次，
+        // 而轮询在监听器真的起不来时同样会失败（超时），不会掩盖问题。
+        assert!(
+            wait_until_listening(port, Duration::from_secs(5)).await,
+            "坏配置被拒绝后，原有监听器应当继续服务"
+        );
 
         sup.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -919,10 +946,9 @@ mod tests {
         assert_eq!(sup.route_count().await, 1, "runtimes accumulated");
         assert_eq!(sup.applied_revision(), 2);
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", second)).await.is_ok(),
-            "the new listener is not serving"
+            wait_until_listening(second, Duration::from_secs(5)).await,
+            "替换后的新监听器没有在服务"
         );
 
         sup.shutdown().await;

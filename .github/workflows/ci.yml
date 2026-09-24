@@ -88,6 +88,26 @@ jobs:
             bash -n "$f" || exit 1
           done
 
+      # 可执行位必须记在 git 里。
+      #
+      # Windows 上 core.filemode=false，git 不记录 x 位，新增的脚本会以 100644 入库。
+      # 后果是 CI 里 `./scripts/release.sh` 直接 exit 126（命令不可执行），而
+      # quick-install.sh 内部 `exec "$DEPLOY"` 同样会失败 —— 这类错误信息离真正的
+      # 原因很远。在这里拦住，比让人对着 126 猜半天便宜。
+      #
+      # 修法：git update-index --chmod=+x scripts/xxx.sh
+      - name: 检查脚本可执行位
+        run: |
+          bad=0
+          while read -r mode _ _ path; do
+            if [[ "$mode" != "100755" ]]; then
+              echo "::error file=$path::$path 缺少可执行位（当前 $mode）。修复：git update-index --chmod=+x $path"
+              bad=1
+            fi
+          done < <(git ls-files -s scripts/*.sh)
+          [[ "$bad" -eq 0 ]] || exit 1
+          echo "全部脚本均有可执行位"
+
       # shellcheck 暂不阻断构建：开发机上没有它，这些脚本从未被它检查过，
       # 直接设为阻断很可能在第一次运行时就红。先让它把问题报出来，清完之后
       # 再去掉 continue-on-error。

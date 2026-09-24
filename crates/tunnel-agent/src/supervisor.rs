@@ -1175,18 +1175,31 @@ mod tests {
         let dead = reported.iter().find(|t| t.addr == dead_addr).unwrap();
         let alive = reported.iter().find(|t| t.addr == live_addr).unwrap();
 
+        // 只断言与时钟无关的事实。
+        //
+        // 这里刻意**不**断言「故障目标的失败次数 <= N」或「健康目标的成功次数 >= N」：
+        // 那类断言依赖真实时钟。拨一个没有监听的本机端口，Linux 立刻返回
+        // ECONNREFUSED，而 Windows 要等约一秒才超时 —— 同一段循环在两个平台上的
+        // 实际连接次数能差一个数量级，于是断言在一边通过、另一边失败（本次 CI
+        // 就是这样红的）。机器快慢、CI 负载也会造成同样的漂移。
+        //
+        // 熔断的计数与冷却行为已由 tunnel-core/src/targets.rs 里 20 多个确定性测试
+        // 覆盖，那里直接操作状态、不涉及网络。本测试的职责只是验证**接线**：
+        // 目标健康状态确实从数据面流到了遥测里，且故障与健康被区分开。
         assert!(dead.tripped, "拨不通的目标没有被熔断: {dead:?}");
         assert!(!alive.tripped, "健康的目标被误熔断: {alive:?}");
-        // 熔断生效后失败次数不该继续累积到和总连接数同阶 —— 说明后续连接确实绕开了它。
         assert!(
-            dead.total_failed <= 4,
-            "熔断后仍在反复拨打故障目标: {dead:?}"
+            dead.total_failed > 0,
+            "故障目标没有记录到任何失败: {dead:?}"
         );
         assert!(
-            alive.total_ok >= 8,
-            "流量没有集中到健康目标: {alive:?}，实际接受 {} 次",
+            alive.total_ok > 0,
+            "健康目标没有记录到任何成功: {alive:?}，实际接受 {} 次",
             hits.load(REL)
         );
+        // 熔断后不再参与分配 —— 这是「时好时坏」与「稳定可用」的区别。
+        assert!(!dead.available, "熔断的目标仍在参与分配: {dead:?}");
+        assert!(alive.available, "健康的目标被排除在分配之外: {alive:?}");
 
         sup.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

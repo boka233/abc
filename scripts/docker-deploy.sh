@@ -28,6 +28,12 @@ readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ENV_FILE="$REPO_ROOT/.env"
 readonly CONF_FILE="$REPO_ROOT/configs/control.docker.toml"
 
+# 容器内运行进程的 uid。必须与 Dockerfile 里 `useradd --uid 10001 tunnel` 一致。
+#
+# 挂进容器的配置文件是 0600 的，属主得是这个 uid 才读得到；宿主机上它属于 root
+# 的话容器只会拿到 Permission denied。改这个值时 Dockerfile 要同步改。
+readonly CONTAINER_UID=10001
+
 if [[ -t 1 ]]; then
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
     C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
@@ -276,6 +282,11 @@ if [[ -f "$CONF_FILE" ]]; then
         sed -i "s|^public_url = .*|public_url = \"https://$DOMAIN\"|" "$CONF_FILE"
         info "已更新 public_url 为 https://$DOMAIN"
     fi
+    # 修正属主。早先版本生成的配置属于 root，容器以 uid 10001 运行时读不到，
+    # 表现为反复 "Permission denied (os error 13)" 且健康检查一直不过。
+    # 每次都执行而不是只在不匹配时执行：chown 是幂等的，判断反而更容易写错。
+    chown "$CONTAINER_UID:$CONTAINER_UID" "$CONF_FILE"
+    chmod 600 "$CONF_FILE"
 else
     JWT="$(generate_secret)"
     PSK="$(generate_secret)"
@@ -339,6 +350,16 @@ level = "info"
 format = "json"
 EOF
     chmod 600 "$CONF_FILE"
+    # 属主改成容器内的 uid。
+    #
+    # 文件含 jwt_secret 与 tunnel_psk，所以权限必须是 0600 —— 但容器里进程以
+    # USER tunnel（uid 10001，见 Dockerfile）运行，而宿主机上这个文件属于 root，
+    # uid 不匹配就读不了，容器会反复报 "Permission denied (os error 13)" 然后
+    # 健康检查一直不过。
+    #
+    # 不放宽到 0644：那样宿主机上任何用户都能读到隧道 PSK。改属主才是对的做法，
+    # 前提是 Dockerfile 里那个 uid 是写死的（确实是）。
+    chown "$CONTAINER_UID:$CONTAINER_UID" "$CONF_FILE"
     ok "已生成 $CONF_FILE 并写入随机密钥"
 fi
 

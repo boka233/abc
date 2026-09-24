@@ -373,21 +373,24 @@ elif [[ -x "$REPO_ROOT/target/release/tunnel-agent" ]]; then
         "tunnel-control:/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH" \
         && ok "已放置 tunnel-agent-$ASSET_ARCH（来自本机 target/release）"
 else
-    # 从构建镜像里取：Dockerfile 的 build 阶段编了整个 workspace，agent 也在里面。
+    # 从构建镜像里取。Dockerfile 的 build 阶段同时编了 control 与 agent，
+    # 就是为了这一步。
     info "本机没有已编译的 agent，从构建镜像中提取…"
-    if docker build --target build -t tunnel-build:local "$REPO_ROOT" >/dev/null 2>&1; then
+    # 不丢 stderr：上一版把它丢了，于是构建失败时只显示一句「跳过」，
+    # 真正的原因（比如依赖 MSRV 超出基础镜像）完全看不到。
+    if docker build --target build -t tunnel-build:local "$REPO_ROOT"; then
         cid="$(docker create tunnel-build:local)"
-        if docker cp "$cid:/src/target/release/tunnel-agent" /tmp/tunnel-agent 2>/dev/null; then
+        if docker cp "$cid:/src/target/release/tunnel-agent" /tmp/tunnel-agent; then
             docker cp /tmp/tunnel-agent \
                 "tunnel-control:/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH"
             rm -f /tmp/tunnel-agent
             ok "已放置 tunnel-agent-$ASSET_ARCH"
         else
-            warn "无法从镜像提取 agent 二进制"
+            warn "无法从构建镜像提取 agent 二进制"
         fi
         docker rm -f "$cid" >/dev/null 2>&1 || true
     else
-        warn "构建阶段镜像失败，跳过"
+        warn "构建阶段镜像失败，见上方输出"
     fi
 fi
 

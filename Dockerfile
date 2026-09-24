@@ -26,7 +26,16 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # Rust
 # ---------------------------------------------------------------------------
-FROM rust:1.80-bookworm AS build
+# 用 rust:1-bookworm（跟随最新稳定版）而不是固定的 1.80。
+#
+# 为什么：Cargo.lock 里锁定的依赖有自己的 MSRV，且会随 cargo update 往上走 ——
+# 目前 base64ct 1.8.3 要 1.85、icu_collections 2.3.0 要 1.86、darling_core 0.23
+# 要 1.88。固定 1.80 会在这些依赖更新后突然构建失败，而失败信息出现在依赖的
+# 编译输出里，离真正原因很远（exit code 101，要翻上百行日志才看到 MSRV 提示）。
+#
+# workspace 的 rust-version = "1.80" 描述的是**本项目代码**的下限，不是依赖树的。
+# 两者不是一回事。
+FROM rust:1-bookworm AS build
 
 # ring 与 libsqlite3-sys 含 C 代码，需要 cc 与 pkg-config。
 RUN apt-get update \
@@ -35,35 +44,35 @@ RUN apt-get update \
 
 WORKDIR /src
 
-# 先拷清单与空壳源码，把依赖编译单独缓存成一层。改业务代码时这一层不必重来 ——
-# 这个 workspace 的依赖树编译要几分钟。
+# 一次性拷入全部源码后编译。
+#
+# 这里**不用**「先拷 Cargo.toml + 空壳 src 预热依赖缓存」那个常见技巧：
+# tunnel-control 里有 include_str!("../../../../scripts/agent-install.sh")，
+# 空壳阶段那个文件还不存在，预热编译必然失败；而为了让构建继续就得写成
+# `|| true` 并丢掉 stderr —— 结果是这一层什么也没缓存，却让真正的编译错误
+# 变得难以察觉（本次 MSRV 不匹配就是被这样掩盖的一部分）。
+#
+# 需要加速重复构建时用 BuildKit 缓存挂载，比空壳技巧更可靠：
+#   DOCKER_BUILDKIT=1 docker build ...
+# 并把下面的 RUN 换成带 --mount=type=cache,target=/usr/local/cargo/registry 的形式。
+#
+# migrations 必须在编译前就位：sqlx::migrate! 是编译期宏，会把 SQL 读进二进制。
 COPY Cargo.toml Cargo.lock ./
-COPY crates/tunnel-common/Cargo.toml crates/tunnel-common/
-COPY crates/tunnel-protocol/Cargo.toml crates/tunnel-protocol/
-COPY crates/tunnel-core/Cargo.toml crates/tunnel-core/
-COPY crates/tunnel-storage/Cargo.toml crates/tunnel-storage/
-COPY crates/tunnel-control/Cargo.toml crates/tunnel-control/
-COPY crates/tunnel-agent/Cargo.toml crates/tunnel-agent/
-RUN set -eux; \
-    for c in tunnel-common tunnel-protocol tunnel-core tunnel-storage; do \
-        mkdir -p "crates/$c/src" && echo '' > "crates/$c/src/lib.rs"; \
-    done; \
-    for c in tunnel-control tunnel-agent; do \
-        mkdir -p "crates/$c/src" && echo 'fn main() {}' > "crates/$c/src/main.rs"; \
-    done; \
-    # tunnel-control 既有 lib 也有 main。
-    echo '' > crates/tunnel-control/src/lib.rs; \
-    cargo build --release --locked 2>/dev/null || true
-
-# 真实源码。migrations 必须在编译前就位：sqlx::migrate! 是编译期宏，会把 SQL 读进
-# 二进制 —— 少了它编译直接失败，而不是运行时才报错。
 COPY crates/ crates/
 COPY migrations/ migrations/
 COPY scripts/agent-install.sh scripts/
-# 触碰源码文件，确保上面空壳留下的时间戳不会让 cargo 误判为无需重编。
-RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --locked -p tunnel-control \
-    && strip target/release/tunnel-control
+
+# 同时编译 control 与 agent。
+#
+# agent 不进运行时镜像（它要操作宿主网络栈，容器化没有隔离价值），但必须在这一阶段
+# 产出：docker-deploy.sh 会从这个 build 阶段把它拷出来，放进控制面的
+# agent_binary_dir，供一键对接的机器下载。只编 control 会让那一步静默拿不到文件，
+# 而症状要等到有人真去对接机器时才暴露。
+#
+# --locked：严格按 Cargo.lock 构建。没有它 cargo 可能拉到更新的依赖，导致镜像内容
+# 与仓库状态不一致，且依赖的 MSRV 可能再次超出基础镜像。
+RUN cargo build --release --locked -p tunnel-control -p tunnel-agent \
+    && strip target/release/tunnel-control target/release/tunnel-agent
 
 # ---------------------------------------------------------------------------
 # 运行时

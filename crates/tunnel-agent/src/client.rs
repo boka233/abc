@@ -25,6 +25,7 @@
 //! The same request/response code runs over both transports; HTTPS is never
 //! downgraded to plaintext, because every request carries the group token.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -320,7 +321,7 @@ where
     }
     stream.flush().await?;
 
-    // Stop at Content-Length when available. A TLS peer may close the TCP
+    // Stop when the declared body is complete. A TLS peer may close the TCP
     // connection without close_notify; reading past a complete response would
     // otherwise turn a successful exchange into an unexpected-EOF error.
     let mut buf = Vec::with_capacity(8 * 1024);
@@ -352,6 +353,16 @@ fn expected_response_len(raw: &[u8]) -> Result<Option<usize>> {
     };
     let head = std::str::from_utf8(&raw[..head_end])
         .map_err(|_| Error::protocol("invalid HTTP response headers"))?;
+    let body_start = head_end + terminator_len;
+    if is_chunked(head) {
+        return chunked_body(&raw[body_start..], |_| Ok(()))?
+            .map(|len| {
+                body_start
+                    .checked_add(len)
+                    .ok_or_else(|| Error::limit("control plane response size overflow"))
+            })
+            .transpose();
+    }
     for line in head.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -374,6 +385,72 @@ fn expected_response_len(raw: &[u8]) -> Result<Option<usize>> {
         }
     }
     Ok(None)
+}
+
+fn is_chunked(head: &str) -> bool {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            name.eq_ignore_ascii_case("Transfer-Encoding")
+                && value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+        })
+}
+
+/// Visit complete chunks, returning the number of encoded bytes once the
+/// terminating chunk and any trailers have arrived.
+fn chunked_body<F>(body: &[u8], mut visit: F) -> Result<Option<usize>>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    let mut pos = 0;
+    loop {
+        let Some(line_end) = body[pos..].windows(2).position(|pair| pair == b"\r\n") else {
+            return Ok(None);
+        };
+        let size_line = &body[pos..pos + line_end];
+        let size_text = size_line
+            .split(|byte| *byte == b';')
+            .next()
+            .unwrap_or(size_line);
+        let size_text =
+            std::str::from_utf8(size_text).map_err(|_| Error::protocol("invalid chunk size"))?;
+        let size = usize::from_str_radix(size_text.trim(), 16)
+            .map_err(|_| Error::protocol("invalid chunk size"))?;
+        pos += line_end + 2;
+
+        if size == 0 {
+            loop {
+                let Some(line_end) = body[pos..].windows(2).position(|pair| pair == b"\r\n") else {
+                    return Ok(None);
+                };
+                pos += line_end + 2;
+                if line_end == 0 {
+                    return Ok(Some(pos));
+                }
+            }
+        }
+
+        let end = pos
+            .checked_add(size)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| Error::limit("control plane response size overflow"))?;
+        if end > MAX_RESPONSE_BYTES {
+            return Err(Error::limit(format!(
+                "control plane response exceeded {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        if body.len() < end {
+            return Ok(None);
+        }
+        if &body[end - 2..end] != b"\r\n" {
+            return Err(Error::protocol("malformed chunked response"));
+        }
+        visit(&body[pos..end - 2])?;
+        pos = end;
+    }
 }
 
 /// 请求头名称，必须与控制面的提取器一致。改动会静默破坏所有已部署的 agent。
@@ -405,8 +482,20 @@ fn parse_response(raw: &[u8]) -> Result<Vec<u8>> {
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| Error::protocol(format!("unparseable status line `{status_line}`")))?;
 
+    let body: Cow<'_, [u8]> = if is_chunked(&head) {
+        let mut decoded = Vec::new();
+        chunked_body(body, |chunk| {
+            decoded.extend_from_slice(chunk);
+            Ok(())
+        })?
+        .ok_or_else(|| Error::protocol("incomplete chunked response"))?;
+        Cow::Owned(decoded)
+    } else {
+        Cow::Borrowed(body)
+    };
+
     match status {
-        200..=299 => Ok(body.to_vec()),
+        200..=299 => Ok(body.into_owned()),
         401 | 403 => Err(Error::Auth("control plane rejected the agent credentials")),
         404 => Err(Error::NotFound("control plane endpoint".into())),
         // 5xx and 429 are worth retrying; the supervisor's backoff handles it.
@@ -478,6 +567,20 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
         let body = parse_response(raw).unwrap();
         assert_eq!(body, b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn chunked_json_response_is_decoded() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9;part=1\r\n{\"unchang\r\n9\r\ned\":true}\r\n0\r\nX-End: yes\r\n\r\n";
+        assert_eq!(expected_response_len(raw).unwrap(), Some(raw.len()));
+        assert_eq!(parse_response(raw).unwrap(), b"{\"unchanged\":true}");
+        assert_eq!(expected_response_len(&raw[..raw.len() - 2]).unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_chunked_response_is_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nokXX0\r\n\r\n";
+        assert!(parse_response(raw).is_err());
     }
 
     #[test]
@@ -625,11 +728,11 @@ mod tests {
             let n = socket.read(&mut buf).await.unwrap();
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
             socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"unchanged\":true}")
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\n{\"unchanged\":true}\r\n0\r\n\r\n")
                 .await
                 .unwrap();
-            // Deliberately omit TLS close_notify: the declared Content-Length
-            // is sufficient to finish the response.
+            // Deliberately omit TLS close_notify: the terminating chunk is
+            // sufficient to finish the response.
             drop(socket);
             request
         });
@@ -726,8 +829,10 @@ mod tests {
                 }
             })
             .to_string();
-            let response =
-                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            );
             let _ = sock.write_all(response.as_bytes()).await;
             let _ = sock.shutdown().await;
         });

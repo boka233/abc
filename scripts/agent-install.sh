@@ -403,7 +403,10 @@ if ! sudo -u "$SERVICE_USER" "$BIN_DIR/tunnel-agent" --config "$CONF" check; the
     die "配置校验失败，请检查上方输出"
 fi
 
-systemctl enable --now tunnel-agent
+systemctl enable tunnel-agent
+# Re-running the one-click installer may have replaced an older binary or
+# config while its process kept running. Always start the installed version.
+systemctl restart tunnel-agent
 
 sleep 3
 if systemctl is-active --quiet tunnel-agent; then
@@ -417,7 +420,8 @@ fi
 # ---------------------------------------------------------------------------
 printf '\n%s================ 对接完成 ================%s\n\n' "$C_BOLD" "$C_RESET"
 cat <<EOF
-机器已向设备组注册。回到面板「设备组」页面应能看到本机上线。
+agent 服务已启动。注册及心跳成功后，面板「设备组」页面会显示本机上线。
+若仍显示离线，请查看：journalctl -u tunnel-agent -n 50 --no-pager
 
 ${C_BOLD}后续步骤${C_RESET}
 

@@ -211,6 +211,67 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 自动领取隧道证书
+# ---------------------------------------------------------------------------
+step "配置隧道 TLS"
+
+if ! command -v openssl >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y openssl || die "无法安装 openssl"
+    else
+        die "缺少 openssl，请先安装后重试"
+    fi
+fi
+
+AUTH_HEADERS=(-H "X-Agent-Token: $TOKEN" -H "X-Agent-Name: $NODE_NAME" -H "X-Agent-Hostname: $(hostname)")
+[[ -n "$ROLE" ]] && AUTH_HEADERS+=(-H "X-Agent-Role: $ROLE")
+TMP_CA="$(mktemp)"
+TMP_CERT="$(mktemp)"
+TMP_CSR="$(mktemp)"
+trap 'rm -f "$TMP_BIN" "$TMP_HDR" "$TMP_CA" "$TMP_CERT" "$TMP_CSR"' EXIT
+
+curl -fsSL --connect-timeout 10 --max-time 30 \
+    "${AUTH_HEADERS[@]}" -D "$TMP_HDR" -o "$TMP_CA" \
+    "$PANEL_URL/api/agent/ca.pem" || die "无法从控制面领取隧道 CA，请确认面板已升级并配置 CA"
+openssl x509 -in "$TMP_CA" -noout >/dev/null 2>&1 || die "控制面返回的 CA 证书无效"
+
+EFFECTIVE_ROLE="$(tr -d '\r' < "$TMP_HDR" | awk 'tolower($1) == "x-agent-role:" { print $2 }' | tail -n 1)"
+case "$EFFECTIVE_ROLE" in
+    entry|exit|both) ok "控制面确认本机角色：$EFFECTIVE_ROLE" ;;
+    *) die "控制面未返回有效的节点角色" ;;
+esac
+
+if [[ -f "$TLS_DIR/ca.pem" ]]; then
+    OLD_FP="$(openssl x509 -in "$TLS_DIR/ca.pem" -fingerprint -sha256 -noout 2>/dev/null || true)"
+    NEW_FP="$(openssl x509 -in "$TMP_CA" -fingerprint -sha256 -noout)"
+    [[ "$OLD_FP" == "$NEW_FP" ]] || die "本机 CA 与控制面不同；为避免破坏现有隧道，已停止。请确认是否连接了正确的面板"
+fi
+install -m 644 -o "$SERVICE_USER" -g "$SERVICE_USER" "$TMP_CA" "$TLS_DIR/ca.pem"
+ok "已安装 $TLS_DIR/ca.pem"
+
+if [[ "$EFFECTIVE_ROLE" == "exit" || "$EFFECTIVE_ROLE" == "both" ]]; then
+    if [[ ! -f "$TLS_DIR/exit.key" ]]; then
+        openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$TLS_DIR/exit.key" >/dev/null 2>&1 || die "无法生成出口私钥"
+    fi
+    chown "$SERVICE_USER:$SERVICE_USER" "$TLS_DIR/exit.key"
+    chmod 600 "$TLS_DIR/exit.key"
+    openssl req -new -key "$TLS_DIR/exit.key" -subj '/CN=tunnel-exit' \
+        -out "$TMP_CSR" >/dev/null 2>&1 || die "无法创建出口证书请求"
+    curl -fsSL --connect-timeout 10 --max-time 30 \
+        "${AUTH_HEADERS[@]}" -H 'Content-Type: application/pkcs10' \
+        --data-binary "@$TMP_CSR" -o "$TMP_CERT" \
+        "$PANEL_URL/api/agent/certificate" || die "控制面签发出口证书失败，请检查 CA 私钥和控制面日志"
+    openssl verify -CAfile "$TLS_DIR/ca.pem" "$TMP_CERT" >/dev/null 2>&1 \
+        || die "签发的出口证书无法通过 CA 验证"
+    KEY_FP="$(openssl pkey -in "$TLS_DIR/exit.key" -pubout -outform DER 2>/dev/null | openssl dgst -sha256)"
+    CERT_FP="$(openssl x509 -in "$TMP_CERT" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256)"
+    [[ -n "$KEY_FP" && "$KEY_FP" == "$CERT_FP" ]] || die "出口证书与本机私钥不匹配"
+    install -m 644 -o "$SERVICE_USER" -g "$SERVICE_USER" "$TMP_CERT" "$TLS_DIR/exit.pem"
+    ok "出口证书已签发；私钥仅保存在本机"
+fi
+
+# ---------------------------------------------------------------------------
 # 写配置
 # ---------------------------------------------------------------------------
 step "写入配置"
@@ -231,7 +292,7 @@ cat >"$CONF" <<EOF
 enroll_token = "$TOKEN"
 control_url = "$PANEL_URL"
 node_name = "$NODE_NAME"
-$([[ -n "$ROLE" ]] && echo "role = \"$ROLE\"")
+role = "$EFFECTIVE_ROLE"
 
 cache_path = "$DATA_DIR/last-known-good.json"
 
@@ -241,10 +302,8 @@ control_timeout = "10s"
 connection_sample_limit = 200
 
 [tls]
-# 出口机器需要证书与私钥；入口机器只需要 ca_path。
 ca_path = "$TLS_DIR/ca.pem"
-#cert_path = "$TLS_DIR/exit.pem"
-#key_path = "$TLS_DIR/exit.key"
+$([[ "$EFFECTIVE_ROLE" == "entry" ]] || printf 'cert_path = "%s/exit.pem"\nkey_path = "%s/exit.key"\n' "$TLS_DIR" "$TLS_DIR")
 require_client_auth = false
 insecure_skip_verify = false
 
@@ -425,14 +484,9 @@ agent 服务已启动。注册及心跳成功后，面板「设备组」页面�
 
 ${C_BOLD}后续步骤${C_RESET}
 
-  1. 若本机是**出口**，需放置 TLS 证书：
-       $TLS_DIR/ca.pem        （必需）
-       $TLS_DIR/exit.pem      （出口必需）
-       $TLS_DIR/exit.key      （出口必需）
-     生成方式见 scripts/gen-certs.sh，放好后执行：
-       systemctl restart tunnel-agent
+  1. 隧道 CA 与本机角色所需证书已自动安装。
 
-  2. 在面板的设备组详情页为本机添加「隧道地址」，
+  2. 若本机是出口，在面板设备组详情页添加「隧道地址」，
      入口才知道该拨向哪个地址。
 
   3. IEPL 双网卡主机：配置隧道地址之前必须先按

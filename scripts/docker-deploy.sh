@@ -27,6 +27,7 @@ set -euo pipefail
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ENV_FILE="$REPO_ROOT/.env"
 readonly CONF_FILE="$REPO_ROOT/configs/control.docker.toml"
+readonly CA_DIR="$REPO_ROOT/certs"
 
 # 容器内运行进程的 uid。必须与 Dockerfile 里 `useradd --uid 10001 tunnel` 一致。
 #
@@ -100,6 +101,28 @@ done
 
 [[ "$(uname -s)" == "Linux" ]] || die "本脚本仅支持 Linux"
 [[ $EUID -eq 0 ]] || die "需要 root 权限运行，请使用 sudo"
+
+# CA 文件放在仓库的 certs/（已被 .gitignore 忽略），只在第一次部署时创建。
+# 已有部署沿用原有 CA；绝不能在重跑脚本时轮换它。
+if [[ "$MODE" != "down" && "$MODE" != "destroy" && "$MODE" != "logs" ]]; then
+    step "准备隧道 CA"
+    if [[ -f "$CA_DIR/ca.pem" && -f "$CA_DIR/ca.key" ]]; then
+        ok "沿用现有隧道 CA"
+    elif [[ -e "$CA_DIR/ca.pem" || -e "$CA_DIR/ca.key" ]]; then
+        die "$CA_DIR 中的 CA 文件不完整，请恢复原有 ca.pem 与 ca.key，不能重新生成"
+    else
+        if ! command -v openssl >/dev/null 2>&1; then
+            command -v apt-get >/dev/null 2>&1 || die "缺少 openssl，请先安装"
+            apt-get update && apt-get install -y openssl || die "无法安装 openssl"
+        fi
+        OUT_DIR="$CA_DIR" "$REPO_ROOT/scripts/gen-certs.sh" ca
+        ok "已创建隧道 CA"
+    fi
+    chown "$CONTAINER_UID:$CONTAINER_UID" "$CA_DIR" "$CA_DIR/ca.pem" "$CA_DIR/ca.key"
+    chmod 700 "$CA_DIR"
+    chmod 644 "$CA_DIR/ca.pem"
+    chmod 600 "$CA_DIR/ca.key"
+fi
 
 # ---------------------------------------------------------------------------
 # Docker
@@ -179,7 +202,7 @@ case "$MODE" in
         exit 0 ;;
     destroy)
         ensure_docker
-        warn "这会删除数据库、已注册的机器、审计日志与证书，且不可恢复。"
+        warn "这会删除数据库、已注册的机器、审计日志与 Caddy 证书，且不可恢复。隧道 CA 位于 $CA_DIR，会保留。"
         read -r -p "确认删除？输入 yes 继续：" confirm
         [[ "$confirm" == "yes" ]] || { info "已取消"; exit 0; }
         compose down -v

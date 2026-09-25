@@ -153,6 +153,18 @@ install_control() {
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 750 "$CONTROL_DATA_DIR"
     install -d -m 755 "$CONTROL_CONF_DIR"
 
+    if [[ -f "$TLS_DIR/ca.pem" && -f "$TLS_DIR/ca.key" ]]; then
+        info "沿用 $TLS_DIR 中的隧道 CA"
+    elif [[ -e "$TLS_DIR/ca.pem" || -e "$TLS_DIR/ca.key" ]]; then
+        die "$TLS_DIR 中的 CA 文件不完整，请恢复原有 ca.pem 与 ca.key"
+    else
+        OUT_DIR="$TLS_DIR" "$REPO_ROOT/scripts/gen-certs.sh" ca
+    fi
+    chown "$SERVICE_USER:$SERVICE_USER" "$TLS_DIR" "$TLS_DIR/ca.pem" "$TLS_DIR/ca.key"
+    chmod 750 "$TLS_DIR"
+    chmod 644 "$TLS_DIR/ca.pem"
+    chmod 600 "$TLS_DIR/ca.key"
+
     local conf="$CONTROL_CONF_DIR/config.toml"
     if [[ -f "$conf" ]]; then
         # 不覆盖：管理员可能已经改过限额、监听地址等。

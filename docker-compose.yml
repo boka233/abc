@@ -32,6 +32,7 @@ services:
       - control-data:/var/lib/tunnel-control
       # 配置由 docker-deploy.sh 生成。只读挂载 —— 容器没有改它的理由。
       - ./configs/control.docker.toml:/etc/tunnel-control/config.toml:ro
+      - ./certs:/etc/tunnel:ro
 
     # 不对宿主暴露 8080。外部访问一律走反代，避免绕过 TLS 直连明文端口。
     # 需要本机调试时把下面两行放开。

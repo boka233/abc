@@ -447,7 +447,7 @@ function kindClass(kind: string): string {
         <label>TLS 服务器名</label>
         <input v-model="epForm.tls_server_name" placeholder="exit.internal" />
         <div class="hint">
-          地址是裸 IP 而证书带主机名时必填，否则证书校验会失败。
+          一键对接的出口会自动使用签发的 TLS 名称。手动部署证书时，请填写证书中的名称。
         </div>
       </div>
       <div class="modal-actions">

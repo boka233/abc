@@ -74,8 +74,8 @@ bash <(curl -fsSL .../quick-install.sh)
 sudo ./scripts/docker-deploy.sh -d panel.example.com -e you@example.com
 ```
 
-这会：构建镜像 → 生成配置与随机密钥 → 启动控制面与反代 → 申请 HTTPS 证书 →
-放好 agent 二进制 → 打印首次登录密码。
+这会：准备并保留隧道 CA → 构建镜像 → 生成配置与随机密钥 → 启动控制面与反代 → 申请 HTTPS 证书 →
+放好 agent 二进制 → 打印首次登录密码。隧道 CA 位于 `./certs/`，请连同控制面数据一起备份；`ca.key` 只供控制面签发新出口证书。
 
 没有域名时：
 
@@ -115,6 +115,7 @@ agent 要绑定出站源地址、监听任意端口、读宿主机的网卡列�
 | 卷 | 内容 | 丢失后果 |
 |---|---|---|
 | `control-data` | SQLite 数据库、agent 二进制 | 线路、设备组、审计日志全部丢失 |
+| 宿主机 `./certs` | 隧道 CA 证书和签发私钥 | 无法再为新出口签发证书 |
 | `caddy-data` | 证书与 ACME 账号 | 重新申请证书，容易撞速率限制 |
 | `caddy-config` | Caddy 自动生成的配置 | 可重建，影响不大 |
 

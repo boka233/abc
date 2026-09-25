@@ -20,6 +20,7 @@ use tunnel_storage::nodes::{EndpointRepo, NodeRepo};
 use tunnel_storage::routes::RouteRepo;
 use tunnel_storage::Database;
 
+use crate::api::provision;
 use crate::config::ControlConfig;
 
 /// 为一台机器装配配置 bundle。
@@ -78,7 +79,11 @@ pub async fn build_bundle(
             // 这些地址在对端出口机器上，本机去拨它们。出口组有多台机器时，这里会
             // 收到多个地址，隧道池在它们之间做负载与故障转移。
             if !remote_endpoints.iter().any(|e| e.id == ep.id) {
-                remote_endpoints.push(ep.to_model());
+                let mut endpoint = ep.to_model();
+                if provision::managed_marker(cfg, &ep.node_id).is_file() {
+                    endpoint.tls_server_name = provision::server_name(&ep.node_id);
+                }
+                remote_endpoints.push(endpoint);
             }
         }
         routes.push(row.to_model(endpoint_ids));
@@ -294,6 +299,23 @@ mod tests {
         // Failover order must survive distribution.
         assert_eq!(bundle.remote_endpoints[0].name, "hk-iepl");
         assert_eq!(bundle.remote_endpoints[1].name, "hk-public");
+    }
+
+    #[tokio::test]
+    async fn managed_exit_uses_its_issued_tls_name() {
+        let mut f = fixture().await;
+        add_route(&f, vec![f.iepl_ep.clone()]).await;
+        let dir = std::env::temp_dir().join(format!("tunnel-bundle-{}", uuid::Uuid::new_v4()));
+        f.cfg.database_path = dir.join("control.db");
+        let marker = provision::managed_marker(&f.cfg, &f.exit_node);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "managed").unwrap();
+        let bundle = build_bundle(&f.db, &f.cfg, &f.entry_node).await.unwrap();
+        assert_eq!(
+            bundle.remote_endpoints[0].tls_server_name,
+            provision::server_name(&f.exit_node)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

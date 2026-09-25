@@ -82,7 +82,7 @@ FROM debian:bookworm-slim AS runtime
 # ca-certificates: 反代之外若要访问外部 HTTPS 需要它
 # curl: 健康检查用
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl openssl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 10001 tunnel
 

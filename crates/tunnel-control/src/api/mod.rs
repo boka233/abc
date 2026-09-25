@@ -21,6 +21,7 @@ pub mod error;
 pub mod groups;
 pub mod handlers;
 pub mod middleware;
+pub mod provision;
 pub mod ws;
 
 use std::sync::Arc;
@@ -111,6 +112,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent/register", post(handlers::agent_register))
         .route("/agent/config", get(handlers::agent_config))
         .route("/agent/heartbeat", post(handlers::agent_heartbeat))
+        .route("/agent/ca.pem", get(provision::ca_certificate))
+        .route("/agent/certificate", post(provision::issue_certificate))
         // 一键对接脚本。刻意**不需要认证**：目标机器上还没有任何凭据，令牌是
         // 作为命令行参数传入的，脚本本身不含密钥。
         .route("/agent/install.sh", get(handlers::agent_install_script))
@@ -210,6 +213,7 @@ mod tests {
     #[tokio::test]
     async fn agent_endpoints_reject_a_missing_token() {
         let app = app().await;
+        assert_eq!(get(&app, "/api/agent/ca.pem").await, StatusCode::UNAUTHORIZED);
         assert_eq!(get(&app, "/api/agent/config").await, StatusCode::UNAUTHORIZED);
 
         let status = app
@@ -218,6 +222,18 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/agent/register")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/agent/certificate")
                     .body(Body::empty())
                     .unwrap(),
             )

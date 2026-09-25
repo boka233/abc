@@ -21,15 +21,17 @@
 //!
 //! # Transport security
 //!
-//! Only `http://` is implemented. The control-plane connection is expected to be
-//! on a private/management network, or fronted by a TLS-terminating reverse proxy.
-//! [`ControlClient::new`] refuses `https://` loudly rather than silently
-//! downgrading to plaintext — a silent downgrade would send the agent token in
-//! the clear.
+//! `https://` uses rustls with the system trust store and hostname verification.
+//! The same request/response code runs over both transports; HTTPS is never
+//! downgraded to plaintext, because every request carries the group token.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::{ClientConfig, RootCertStore};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::OnceCell;
+use tokio_rustls::TlsConnector;
 use tunnel_common::model::{AgentConfigBundle, AgentReport};
 use tunnel_common::{Error, Result, Secret};
 
@@ -37,12 +39,12 @@ use tunnel_common::{Error, Result, Secret};
 /// 8 MiB is generous and still bounded.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-/// `Debug` is derived rather than hand-written: `token` is a [`Secret`], which
-/// renders as `***`, so the whole struct is safe to log.
-#[derive(Debug)]
+/// `token` is a [`Secret`], which renders as `***` in the custom debug output.
 pub struct ControlClient {
     host: String,
     port: u16,
+    https: bool,
+    tls: OnceCell<TlsConnector>,
     /// 本机在组内的名称。控制面按 (组, 名称) 登记机器，重复注册会更新原记录。
     node_name: String,
     hostname: Option<String>,
@@ -51,6 +53,21 @@ pub struct ControlClient {
     /// 设备组注册令牌。不含组 id —— 让用户从面板复制两个值是多余的摩擦。
     token: Secret,
     timeout: Duration,
+}
+
+impl std::fmt::Debug for ControlClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlClient")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("https", &self.https)
+            .field("node_name", &self.node_name)
+            .field("hostname", &self.hostname)
+            .field("role", &self.role)
+            .field("token", &self.token)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 /// 注册结果。
@@ -78,16 +95,15 @@ impl ControlClient {
         token: Secret,
         timeout: Duration,
     ) -> Result<Self> {
-        if control_url.starts_with("https://") {
+        let (rest, default_port, https) = if let Some(rest) = control_url.strip_prefix("https://") {
+            (rest, 443, true)
+        } else if let Some(rest) = control_url.strip_prefix("http://") {
+            (rest, 80, false)
+        } else {
             return Err(Error::config(
-                "https control_url is not supported by the built-in client; \
-                 terminate TLS at a local reverse proxy and point control_url at it, \
-                 or use a private network",
+                "control_url must start with http:// or https://",
             ));
-        }
-        let rest = control_url
-            .strip_prefix("http://")
-            .ok_or_else(|| Error::config("control_url must start with http://"))?;
+        };
 
         // Strip any path; the endpoints are fixed.
         let authority = rest.split('/').next().unwrap_or(rest);
@@ -99,7 +115,7 @@ impl ControlClient {
                     .map_err(|_| Error::config(format!("invalid port in `{control_url}`")))?;
                 (h.to_string(), port)
             }
-            _ => (authority.to_string(), 80),
+            _ => (authority.to_string(), default_port),
         };
 
         if host.is_empty() {
@@ -109,6 +125,8 @@ impl ControlClient {
         Ok(Self {
             host,
             port,
+            https,
+            tls: OnceCell::new(),
             node_name: node_name.into(),
             hostname: None,
             role: None,
@@ -242,31 +260,25 @@ impl ControlClient {
         }
         request.push_str("\r\n");
 
-        // One write for headers, one for the body.
+        // The TLS handshake and full exchange share one timeout. Never send the
+        // token before certificate and hostname verification succeeds.
         let exchange = async {
-            stream.write_all(request.as_bytes()).await?;
-            if let Some(payload) = body {
-                stream.write_all(payload).await?;
+            if self.https {
+                let connector = self
+                    .tls
+                    .get_or_try_init(|| async { build_tls_connector() })
+                    .await?;
+                let name = self.host.trim_start_matches('[').trim_end_matches(']');
+                let server_name = rustls::pki_types::ServerName::try_from(name.to_owned())
+                    .map_err(|_| Error::config(format!("invalid TLS hostname `{name}`")))?;
+                let mut tls_stream = connector
+                    .connect(server_name, stream)
+                    .await
+                    .map_err(|e| Error::tls(format!("control plane TLS handshake: {e}")))?;
+                read_response(&mut tls_stream, request.as_bytes(), body).await
+            } else {
+                read_response(&mut stream, request.as_bytes(), body).await
             }
-            stream.flush().await?;
-
-            // `Connection: close` means EOF delimits the response, so no chunked
-            // decoding or Content-Length bookkeeping is needed on the way back.
-            let mut buf = Vec::with_capacity(8 * 1024);
-            let mut chunk = [0u8; 16 * 1024];
-            loop {
-                let n = stream.read(&mut chunk).await?;
-                if n == 0 {
-                    break;
-                }
-                if buf.len() + n > MAX_RESPONSE_BYTES {
-                    return Err(Error::limit(format!(
-                        "control plane response exceeded {MAX_RESPONSE_BYTES} bytes"
-                    )));
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Ok::<Vec<u8>, Error>(buf)
         };
 
         let raw = tokio::time::timeout(self.timeout, exchange)
@@ -275,6 +287,93 @@ impl ControlClient {
 
         parse_response(&raw)
     }
+}
+
+fn build_tls_connector() -> Result<TlsConnector> {
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        // A malformed individual system certificate should not prevent the
+        // remaining trusted roots from being used.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        return Err(Error::config(
+            "HTTPS control_url requires a nonempty system CA trust store",
+        ));
+    }
+
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // The small built-in HTTP client speaks HTTP/1.1 only.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+async fn read_response<S>(stream: &mut S, request: &[u8], body: Option<&[u8]>) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(request).await?;
+    if let Some(payload) = body {
+        stream.write_all(payload).await?;
+    }
+    stream.flush().await?;
+
+    // Stop at Content-Length when available. A TLS peer may close the TCP
+    // connection without close_notify; reading past a complete response would
+    // otherwise turn a successful exchange into an unexpected-EOF error.
+    let mut buf = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_RESPONSE_BYTES {
+            return Err(Error::limit(format!(
+                "control plane response exceeded {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(total) = expected_response_len(&buf)? {
+            if buf.len() >= total {
+                buf.truncate(total);
+                break;
+            }
+        }
+    }
+    Ok(buf)
+}
+
+fn expected_response_len(raw: &[u8]) -> Result<Option<usize>> {
+    let Some((head_end, terminator_len)) = find_header_end(raw) else {
+        return Ok(None);
+    };
+    let head = std::str::from_utf8(&raw[..head_end])
+        .map_err(|_| Error::protocol("invalid HTTP response headers"))?;
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("Content-Length") {
+            let body_len = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| Error::protocol("invalid Content-Length"))?;
+            let total = head_end
+                .checked_add(terminator_len)
+                .and_then(|n| n.checked_add(body_len))
+                .ok_or_else(|| Error::limit("control plane response size overflow"))?;
+            if total > MAX_RESPONSE_BYTES {
+                return Err(Error::limit(format!(
+                    "control plane response exceeded {MAX_RESPONSE_BYTES} bytes"
+                )));
+            }
+            return Ok(Some(total));
+        }
+    }
+    Ok(None)
 }
 
 /// 请求头名称，必须与控制面的提取器一致。改动会静默破坏所有已部署的 agent。
@@ -308,9 +407,7 @@ fn parse_response(raw: &[u8]) -> Result<Vec<u8>> {
 
     match status {
         200..=299 => Ok(body.to_vec()),
-        401 | 403 => Err(Error::Auth(
-            "control plane rejected the agent credentials",
-        )),
+        401 | 403 => Err(Error::Auth("control plane rejected the agent credentials")),
         404 => Err(Error::NotFound("control plane endpoint".into())),
         // 5xx and 429 are worth retrying; the supervisor's backoff handles it.
         status => {
@@ -328,7 +425,9 @@ fn find_header_end(raw: &[u8]) -> Option<(usize, usize)> {
     if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
         return Some((pos, 4));
     }
-    raw.windows(2).position(|w| w == b"\n\n").map(|pos| (pos, 2))
+    raw.windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|pos| (pos, 2))
 }
 
 #[cfg(test)]
@@ -351,14 +450,19 @@ mod tests {
         // A trailing path is ignored; endpoints are fixed.
         let c = client("http://10.0.0.5:8080/api/").unwrap();
         assert_eq!(c.endpoint(), "10.0.0.5:8080");
+
+        let c = client("https://control.internal").unwrap();
+        assert_eq!(c.endpoint(), "control.internal:443");
+        assert!(c.https);
+
+        let c = client("https://control.internal:8443/path").unwrap();
+        assert_eq!(c.endpoint(), "control.internal:8443");
     }
 
     #[test]
-    fn https_is_refused_rather_than_silently_downgraded() {
-        // Downgrading would put the agent token on the wire in plaintext.
-        let err = client("https://control.internal").unwrap_err();
-        assert!(matches!(err, Error::Config(_)));
-        assert!(err.to_string().contains("reverse proxy"), "{err}");
+    fn https_does_not_downgrade_to_plaintext() {
+        let c = client("https://control.internal").unwrap();
+        assert!(c.https);
     }
 
     #[test]
@@ -424,7 +528,11 @@ mod tests {
         let mut raw = b"HTTP/1.1 500 Internal Server Error\r\n\r\n".to_vec();
         raw.extend_from_slice(&vec![b'x'; 10_000]);
         let message = parse_response(&raw).unwrap_err().to_string();
-        assert!(message.len() < 400, "error message not bounded: {}", message.len());
+        assert!(
+            message.len() < 400,
+            "error message not bounded: {}",
+            message.len()
+        );
     }
 
     #[test]
@@ -497,6 +605,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn https_request_verifies_the_certificate_and_sends_credentials() {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = acceptor.accept(socket).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"unchanged\":true}")
+                .await
+                .unwrap();
+            // Deliberately omit TLS close_notify: the declared Content-Length
+            // is sufficient to finish the response.
+            drop(socket);
+            request
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let client = ControlClient::new(
+            &format!("https://{addr}"),
+            "hk-01",
+            Secret::new("group-enrol-token"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(client.tls.set(TlsConnector::from(Arc::new(config))).is_ok());
+
+        assert!(matches!(
+            client.poll_config(None).await.unwrap(),
+            ConfigPoll::Unchanged
+        ));
+        let request = server.await.unwrap();
+        assert!(request.contains("GET /api/agent/config HTTP/1.1"));
+        assert!(request.contains("X-Agent-Token: group-enrol-token"));
+    }
+
+    #[tokio::test]
+    async fn https_rejects_a_certificate_for_the_wrong_host() {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["wrong.internal".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(socket).await;
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = ControlClient::new(
+            &format!("https://{addr}"),
+            "hk-01",
+            Secret::new("group-enrol-token"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(client.tls.set(TlsConnector::from(Arc::new(config))).is_ok());
+
+        let err = client.poll_config(None).await.unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn registration_returns_the_assigned_node_id() {
         // agent 凭组令牌注册，由控制面回传它被分配的机器 id。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -526,9 +726,8 @@ mod tests {
                 }
             })
             .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}"
-            );
+            let response =
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}");
             let _ = sock.write_all(response.as_bytes()).await;
             let _ = sock.shutdown().await;
         });

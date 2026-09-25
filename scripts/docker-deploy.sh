@@ -556,7 +556,16 @@ download_agent_from_release() {
 }
 
 place_agent() {
-    docker cp "$1" "tunnel-control:$AGENT_DEST"
+    docker exec -u 0 tunnel-control install -d -o tunnel -g tunnel -m 755 \
+        /var/lib/tunnel-control/agent-bin || return 1
+    docker cp "$1" "tunnel-control:$AGENT_DEST" || return 1
+    # Release 下载到 mktemp 创建的 0600 文件中；docker cp 保留权限且默认写成
+    # root:root。控制面以 tunnel 用户运行，必须在容器内修正属主和权限。
+    docker exec -u 0 tunnel-control chown tunnel:tunnel "$AGENT_DEST" || return 1
+    docker exec -u 0 tunnel-control chmod 755 "$AGENT_DEST" || return 1
+    docker exec -u tunnel tunnel-control test -s "$AGENT_DEST" || return 1
+    docker exec -u tunnel tunnel-control test -r "$AGENT_DEST" || return 1
+    docker exec -u tunnel tunnel-control test -x "$AGENT_DEST"
 }
 
 if [[ -z "$ASSET_ARCH" ]]; then
@@ -600,12 +609,21 @@ else
     [[ "$PLACED" == "yes" ]] && ok "已放置 $AGENT_DEST"
 fi
 
-if ! docker exec tunnel-control ls "$AGENT_DEST" >/dev/null 2>&1; then
-    warn "agent 二进制未就位 —— 面板上的一键对接命令会报「面板未提供二进制」。"
-    warn "最省事的补法：发一个版本，之后脚本会直接从 Release 下载。"
-    warn "  git tag v$VERSION && git push --tags"
-    warn "或手工放置已有的二进制："
-    warn "  docker cp tunnel-agent tunnel-control:$AGENT_DEST"
+if ! docker exec -u tunnel tunnel-control test -s "$AGENT_DEST" >/dev/null 2>&1 \
+    || ! docker exec -u tunnel tunnel-control test -r "$AGENT_DEST" >/dev/null 2>&1 \
+    || ! docker exec -u tunnel tunnel-control test -x "$AGENT_DEST" >/dev/null 2>&1; then
+    if docker exec -u 0 tunnel-control test -e "$AGENT_DEST" >/dev/null 2>&1; then
+        if docker exec -u 0 tunnel-control test -s "$AGENT_DEST" >/dev/null 2>&1; then
+            warn "agent 二进制已放置，但控制面用户无法读取或执行。"
+            warn "修复：docker exec -u 0 tunnel-control chown tunnel:tunnel $AGENT_DEST"
+            warn "      docker exec -u 0 tunnel-control chmod 755 $AGENT_DEST"
+        else
+            warn "agent 二进制为空文件，请从 Release 重新下载或重新构建。"
+        fi
+    else
+        warn "agent 二进制未就位 —— 面板上的一键对接命令会下载失败。"
+        warn "请确认 Release 含 tunnel-agent-$ASSET_ARCH 及其 .sha256，或先构建 agent 后重跑部署脚本。"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -146,6 +146,8 @@ pub async fn get_group(
         machines.push(value);
     }
 
+    attach_regions(&state, &members, &mut machines).await?;
+
     let routes = RouteRepo::new(&state.db).list().await?;
     let related: Vec<_> = routes
         .iter()
@@ -157,6 +159,71 @@ pub async fn get_group(
         "machines": machines,
         "routes": related,
     })))
+}
+
+/// 给每台机器补上 `v4_region` / `v6_region`（ISO 国家代码，如 `HK`）。
+///
+/// 地址的选取用与心跳里触发查询**同一个**函数，保证查的和显示的是同一个 IP。
+/// 全部机器的国家代码一次查询取出，不是每台一次。
+///
+/// 缓存里还没有的（首次心跳刚触发、查询还在进行，或查询失败）字段为 null，
+/// 面板据此显示「识别中」或「—」。
+async fn attach_regions(
+    state: &AppState,
+    members: &[tunnel_storage::models::NodeDto],
+    machines: &mut [serde_json::Value],
+) -> ApiResult<()> {
+    let stale = std::time::Duration::from_secs(state.config().agent.stale_after_secs);
+
+    // 每台机器的 (v4, v6) 候选。
+    let per_machine: Vec<(Option<String>, Option<String>)> = members
+        .iter()
+        .map(|m| {
+            let observed = m.observed_ip.as_deref().and_then(|s| s.parse().ok());
+            // 优先用实时上报里的网卡列表（类型化的），拿不到时再解析存储的 JSON。
+            let interfaces: Vec<tunnel_common::model::InterfaceInfo> = state
+                .report_for(&m.id)
+                .filter(|r| r.age() <= stale)
+                .map(|r| r.report.interfaces.clone())
+                .or_else(|| serde_json::from_value(m.interfaces.clone()).ok())
+                .unwrap_or_default();
+            let ips = crate::api::handlers::candidate_public_ips(
+                observed,
+                m.public_address.as_deref(),
+                m.management_address.as_deref(),
+                &interfaces,
+            );
+            let v4 = ips.iter().find(|ip| ip.is_ipv4()).map(|ip| ip.to_string());
+            let v6 = ips.iter().find(|ip| ip.is_ipv6()).map(|ip| ip.to_string());
+            (v4, v6)
+        })
+        .collect();
+
+    let wanted: Vec<String> = per_machine
+        .iter()
+        .flat_map(|(a, b)| a.iter().chain(b.iter()).cloned())
+        .collect();
+    let countries = tunnel_storage::geo::GeoRepo::new(&state.db)
+        .countries_for(&wanted)
+        .await?;
+
+    for (value, (v4, v6)) in machines.iter_mut().zip(per_machine) {
+        if let Some(obj) = value.as_object_mut() {
+            let region = |ip: &Option<String>| {
+                ip.as_ref()
+                    .and_then(|ip| countries.get(ip))
+                    .map(|c| serde_json::json!(c))
+                    .unwrap_or(serde_json::Value::Null)
+            };
+            obj.insert("v4_region".into(), region(&v4));
+            obj.insert("v6_region".into(), region(&v6));
+            // 同时下发选中的地址：面板直接显示它，不必再用自己的规则重算一遍 ——
+            // 两边规则一旦漂移，显示的 IP 与地区就会对不上。
+            obj.insert("public_v4".into(), serde_json::json!(v4));
+            obj.insert("public_v6".into(), serde_json::json!(v6));
+        }
+    }
+    Ok(())
 }
 
 pub async fn create_group(

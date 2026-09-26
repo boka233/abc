@@ -159,7 +159,11 @@ sqlite3 /var/lib/tunnel-control/control.db ".backup '/backup/control-升级前.d
 ```
 
 判断某个版本有没有引入迁移：看 `migrations/` 目录下的文件是否有新增。当前已有
-0001-0007。升级 v0.1.4 前请先备份数据库；本次新增 0006、0007。
+0001-0010。升级 v0.1.6 前请先备份数据库；本次新增：
+
+- **0009** `route_traffic_totals` —— 线路累计流量的持久化账本。升级时会从保留期内的
+  `traffic_stats` 样本回溯历史；保留期之外（已被清理）的无法找回。
+- **0010** `ip_geo_cache` —— 公网 IP 的地区查询缓存。
 
 ## 发布前自查
 

@@ -145,6 +145,17 @@ export interface NodeDto {
   endpoints?: EndpointDto[]
   tunnels?: TunnelDto[]
   report_age_secs?: number
+  /**
+   * 服务端选出的公网地址与对应地区（ISO 国家代码，如 `HK`）。
+   *
+   * 只由组详情接口下发。地址的选取规则只在服务端保留一份，面板直接显示，
+   * 不再自己重算 —— 两边各有一份规则时，查的与显示的迟早会不是同一个 IP。
+   * 地区为 null 表示还在查询中或查询失败。
+   */
+  public_v4?: string | null
+  public_v6?: string | null
+  v4_region?: string | null
+  v6_region?: string | null
 }
 
 export interface InstallCommandDto {

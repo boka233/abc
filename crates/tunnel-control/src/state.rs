@@ -93,6 +93,8 @@ pub struct AppState {
     /// Count of reports received, for diagnostics.
     reports_received: AtomicU64,
     started_at: Instant,
+    /// 公网 IP → 国家查询。在心跳里触发，后台执行。
+    pub geo: Arc<crate::geo::GeoLookup>,
 }
 
 impl AppState {
@@ -113,6 +115,7 @@ impl AppState {
             events,
             reports_received: AtomicU64::new(0),
             started_at: Instant::now(),
+            geo: crate::geo::GeoLookup::new(),
         })
     }
 

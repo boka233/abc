@@ -742,14 +742,26 @@ impl<'a> RouteRepo<'a> {
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
-        // route_endpoints cascades.
+        // 同一个事务里删线路与它的流量账本。
+        //
+        // route_endpoints 与 traffic_stats 靠外键级联；route_traffic_totals 刻意没有
+        // 外键（否则删机器会抹掉历史流量，见 0009 迁移），所以这里显式清理。
+        //
+        // 放在 repo 里而不是各个 handler 里：删除线路的入口不止一个（单条删除、
+        // 批量删除），写在调用点上，下一个新增的删除路径迟早会忘掉这一步。
+        let mut tx = self.db.pool().begin().await?;
         let result = sqlx::query("DELETE FROM routes WHERE id = ?")
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("route {id}")));
         }
+        sqlx::query("DELETE FROM route_traffic_totals WHERE route_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 

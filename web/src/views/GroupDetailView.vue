@@ -88,83 +88,45 @@ const machines = computed(() => {
   })
 })
 
-function ipv4Octets(address: string): number[] | null {
-  const parts = address.split('.')
-  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return null
-  const octets = parts.map(Number)
-  return octets.every((octet) => octet <= 255) ? octets : null
-}
+/*
+ * 公网地址与地区都由服务端下发，这里只负责显示。
+ *
+ * 以前前端自己挑地址、自己请求 api.country.is 查地区。那样有两个问题：
+ *   1. 每个打开面板的访客都会把全部中转机的公网 IP 发给第三方；
+ *   2. 面板下发的 CSP（connect-src 'self'）本来就拦住了这个请求，地区一直是「—」。
+ * 现在控制面查一次、缓存进数据库，挑地址的规则也只在服务端保留一份 ——
+ * 两边各有一份规则时，查的和显示的迟早会不是同一个 IP。
+ */
 
-function isPublicIpv4(address: string): boolean {
-  const octets = ipv4Octets(address)
-  if (!octets) return false
-  const [a, b] = octets
-  return a !== 0 && a !== 10 && a !== 127 && a < 224 &&
-    !(a === 100 && b >= 64 && b <= 127) &&
-    !(a === 169 && b === 254) &&
-    !(a === 172 && b >= 16 && b <= 31) &&
-    !(a === 192 && b === 168)
-}
-
-function isPublicIpv6(address: string): boolean {
-  const normalized = address.toLowerCase().split('%')[0]
-  return normalized.includes(':') && normalized !== '::1' && normalized !== '::' &&
-    !normalized.startsWith('fe80:') && !normalized.startsWith('fc') &&
-    !normalized.startsWith('fd') && !normalized.startsWith('ff')
-}
-
-function publicIps(machine: NodeDto): { v4?: string; v6?: string } {
-  const addresses = [machine.observed_ip, machine.public_address, machine.management_address]
-    .filter((address): address is string => Boolean(address))
-    .concat((machine.interfaces ?? [])
-    .filter((iface) => !iface.is_loopback)
-    .flatMap((iface) => iface.addresses))
-  return {
-    v4: addresses.find(isPublicIpv4),
-    v6: addresses.find(isPublicIpv6),
+/** 中文国家名。浏览器不支持 Intl.DisplayNames 时退回显示代码本身。 */
+const regionNames = (() => {
+  try {
+    return new Intl.DisplayNames(['zh-CN'], { type: 'region' })
+  } catch {
+    return null
   }
+})()
+
+function regionLabel(code: string | null | undefined, ip: string | null | undefined): string {
+  // 没有公网地址：纯内网机器，本来就没有地区可言。
+  if (!ip) return '—'
+  // 有地址但还没有地区：首次心跳刚触发查询，或查询失败在等退避重试。
+  if (!code) return '识别中'
+  try {
+    return regionNames?.of(code) ?? code
+  } catch {
+    return code
+  }
+}
+
+function regionFor(machine: NodeDto, family: 'v4' | 'v6'): string {
+  return family === 'v4'
+    ? regionLabel(machine.v4_region, machine.public_v4)
+    : regionLabel(machine.v6_region, machine.public_v6)
 }
 
 function machineIp(machine: NodeDto): string {
-  const ips = publicIps(machine)
-  return ips.v4 ?? ips.v6 ?? machine.observed_ip ?? '—'
-}
-
-const geoRegions = ref<Record<string, string>>({})
-const geoRequested = new Set<string>()
-
-// Only look up each public IP once per page visit. A failed lookup leaves the
-// country unknown, without blocking telemetry or route management.
-watch(machines, (members) => {
-  for (const machine of members) {
-    for (const ip of Object.values(publicIps(machine))) {
-      if (!ip || geoRequested.has(ip)) continue
-      geoRequested.add(ip)
-      const controller = new AbortController()
-      const timeout = window.setTimeout(() => controller.abort(), 5000)
-      fetch(`https://api.country.is/${encodeURIComponent(ip)}`, { signal: controller.signal })
-        .then((response) => response.ok ? response.json() : null)
-        .then((data: { country?: string } | null) => {
-          const code = data?.country?.toUpperCase()
-          const localized = code && /^[A-Z]{2}$/.test(code)
-            ? new Intl.DisplayNames(['zh-CN'], { type: 'region' }).of(code)
-            : undefined
-          geoRegions.value = {
-            ...geoRegions.value,
-            [ip]: localized ?? '—',
-          }
-        })
-        .catch(() => {
-          geoRegions.value = { ...geoRegions.value, [ip]: '—' }
-        })
-        .finally(() => window.clearTimeout(timeout))
-    }
-  }
-}, { immediate: true })
-
-function regionFor(machine: NodeDto, family: 'v4' | 'v6'): string {
-  const ip = publicIps(machine)[family]
-  return ip ? (geoRegions.value[ip] ?? '识别中') : '—'
+  return machine.public_v4 ?? machine.public_v6 ?? machine.observed_ip ?? '—'
 }
 
 function usage(used: number, total: number): number {

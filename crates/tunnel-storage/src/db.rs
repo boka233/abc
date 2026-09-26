@@ -451,6 +451,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_traffic_backfill_recovers_history_across_restarts() {
+        // 0009 迁移在升级时从 traffic_stats 回溯线路的累计流量。这里在已迁移的库上
+        // 清空账本、灌入一段真实形状的历史，再执行迁移文件里**同一段** INSERT，
+        // 确认回溯结果正确 —— 这段 SQL 会跑在用户的生产数据上，算错了就是一次性
+        // 永久写错的总量。
+        let db = Database::connect_in_memory().await.unwrap();
+        for sql in [
+            "INSERT INTO device_groups
+             (id, name, region, kind, enroll_token_hash, config_revision, created_at, updated_at)
+             VALUES ('g', 'g', 'cn', 'inbound', '$argon2id$h', 1, 'x', 'x')",
+            "INSERT INTO nodes (id, group_id, name, region, role, config_revision, created_at, updated_at)
+             VALUES ('a', 'g', 'a', 'cn', 'entry', 1, 'x', 'x'),
+                    ('b', 'g', 'b', 'cn', 'entry', 1, 'x', 'x')",
+            "INSERT INTO routes
+             (id, name, entry_group_id, exit_group_id, listen_address, listen_port,
+              target_host, target_port, mode, created_at, updated_at)
+             VALUES ('r', 'r', 'g', 'g', '0.0.0.0', 443, '1.1.1.1', 443, 'direct', 'x', 'x')",
+        ] {
+            sqlx::query(sql).execute(db.pool()).await.unwrap();
+        }
+
+        // 机器 a：涨到 500，重启归零，再涨到 80。机器 b：一路涨到 300。
+        // 另有一条机器级样本（route_id 为空）不该被计入线路。
+        for (at, node, route, rx) in [
+            ("2026-01-01T00:00:01Z", "a", Some("r"), 100),
+            ("2026-01-01T00:00:02Z", "a", Some("r"), 500),
+            ("2026-01-01T00:00:03Z", "a", Some("r"), 0),
+            ("2026-01-01T00:00:04Z", "a", Some("r"), 80),
+            ("2026-01-01T00:00:01Z", "b", Some("r"), 100),
+            ("2026-01-01T00:00:02Z", "b", Some("r"), 300),
+            ("2026-01-01T00:00:02Z", "a", None, 99_999),
+        ] {
+            sqlx::query(
+                "INSERT INTO traffic_stats (bucket_at, node_id, route_id, rx_bytes, tx_bytes)
+                 VALUES (?, ?, ?, ?, 0)",
+            )
+            .bind(at)
+            .bind(node)
+            .bind(route)
+            .bind(rx)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        // 取迁移文件里的回溯语句原文执行，而不是在测试里另写一份。
+        let migration = include_str!("../../../migrations/0009_route_traffic_totals.sql");
+        let backfill = migration
+            .split("INSERT INTO route_traffic_totals")
+            .nth(1)
+            .and_then(|rest| rest.split("-- 按线路求和").next())
+            .expect("迁移文件里找不到回溯语句");
+        sqlx::query("DELETE FROM route_traffic_totals")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(&format!("INSERT INTO route_traffic_totals{backfill}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT node_id, total_rx_bytes, last_rx_bytes
+             FROM route_traffic_totals WHERE route_id = 'r' ORDER BY node_id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+
+        // a：100 + 400 + 0（重启后的第一个读数）+ 80 = 580，基准停在最新的 80。
+        // b：100 + 200 = 300，基准 300。
+        assert_eq!(
+            rows,
+            vec![("a".into(), 580, 80), ("b".into(), 300, 300)],
+            "回溯结果不对"
+        );
+
+        // 回溯之后接着写入，必须从正确的基准继续累加。
+        crate::stats::StatsRepo::new(&db)
+            .record_batch(&[crate::stats::StatSample {
+                node_id: "a".into(),
+                route_id: Some("r".into()),
+                rx_bytes: 120,
+                tx_bytes: 0,
+                rx_bps: 0,
+                tx_bps: 0,
+                connections: 0,
+            }])
+            .await
+            .unwrap();
+        let totals = crate::stats::StatsRepo::new(&db)
+            .route_lifetime_totals()
+            .await
+            .unwrap();
+        assert_eq!(totals["r"].0, 580 + 40 + 300, "回溯后的基准没有被正确沿用");
+    }
+
+    #[tokio::test]
     async fn file_backed_database_round_trips() {
         let dir = std::env::temp_dir().join(format!("tunnel-db-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

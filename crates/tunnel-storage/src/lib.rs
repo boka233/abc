@@ -29,6 +29,7 @@
 
 pub mod audit;
 pub mod db;
+pub mod geo;
 pub mod groups;
 pub mod models;
 pub mod nodes;

@@ -77,30 +77,72 @@ impl<'a> StatsRepo<'a> {
             .bind(s.connections)
             .execute(&mut *tx)
             .await?;
-            if s.route_id.is_none() {
-                sqlx::query(
-                    "INSERT INTO node_traffic_totals
-                     (node_id, total_rx_bytes, total_tx_bytes, last_rx_bytes, last_tx_bytes)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON CONFLICT (node_id) DO UPDATE SET
-                       total_rx_bytes = total_rx_bytes + CASE
-                         WHEN excluded.last_rx_bytes >= last_rx_bytes
-                         THEN excluded.last_rx_bytes - last_rx_bytes
-                         ELSE excluded.last_rx_bytes END,
-                       total_tx_bytes = total_tx_bytes + CASE
-                         WHEN excluded.last_tx_bytes >= last_tx_bytes
-                         THEN excluded.last_tx_bytes - last_tx_bytes
-                         ELSE excluded.last_tx_bytes END,
-                       last_rx_bytes = excluded.last_rx_bytes,
-                       last_tx_bytes = excluded.last_tx_bytes",
-                )
-                .bind(&s.node_id)
-                .bind(s.rx_bytes.max(0))
-                .bind(s.tx_bytes.max(0))
-                .bind(s.rx_bytes.max(0))
-                .bind(s.tx_bytes.max(0))
-                .execute(&mut *tx)
-                .await?;
+            // 累计总量账本。
+            //
+            // agent 上报的是进程启动以来的累计值，进程一重启就归零。账本只累加
+            // 相邻两次读数的增量；新读数小于上一次时视为计数器重启过，把新读数
+            // 本身当作重启后的增量。这样累计总量跨越任意次重启都不会丢。
+            //
+            // 首次见到一个计数器时，total 直接取当前读数：那是计数器上次归零以来
+            // 已经转发的量，是真实流量。
+            let rx = s.rx_bytes.max(0);
+            let tx_bytes = s.tx_bytes.max(0);
+            match &s.route_id {
+                None => {
+                    sqlx::query(
+                        "INSERT INTO node_traffic_totals
+                         (node_id, total_rx_bytes, total_tx_bytes, last_rx_bytes, last_tx_bytes)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON CONFLICT (node_id) DO UPDATE SET
+                           total_rx_bytes = total_rx_bytes + CASE
+                             WHEN excluded.last_rx_bytes >= last_rx_bytes
+                             THEN excluded.last_rx_bytes - last_rx_bytes
+                             ELSE excluded.last_rx_bytes END,
+                           total_tx_bytes = total_tx_bytes + CASE
+                             WHEN excluded.last_tx_bytes >= last_tx_bytes
+                             THEN excluded.last_tx_bytes - last_tx_bytes
+                             ELSE excluded.last_tx_bytes END,
+                           last_rx_bytes = excluded.last_rx_bytes,
+                           last_tx_bytes = excluded.last_tx_bytes",
+                    )
+                    .bind(&s.node_id)
+                    .bind(rx)
+                    .bind(tx_bytes)
+                    .bind(rx)
+                    .bind(tx_bytes)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                Some(route_id) => {
+                    // 逐 (线路, 机器) 记账。一条线路可能同时跑在组内多台机器上，
+                    // 各有独立计数器；回退检测若不按机器分开，一台的读数会被当成
+                    // 另一台的「重启」，总量被严重高估。见 0009 迁移的说明。
+                    sqlx::query(
+                        "INSERT INTO route_traffic_totals
+                         (route_id, node_id, total_rx_bytes, total_tx_bytes,
+                          last_rx_bytes, last_tx_bytes)
+                         VALUES (?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (route_id, node_id) DO UPDATE SET
+                           total_rx_bytes = total_rx_bytes + CASE
+                             WHEN excluded.last_rx_bytes >= last_rx_bytes
+                             THEN excluded.last_rx_bytes - last_rx_bytes
+                             ELSE excluded.last_rx_bytes END,
+                           total_tx_bytes = total_tx_bytes + CASE
+                             WHEN excluded.last_tx_bytes >= last_tx_bytes
+                             THEN excluded.last_tx_bytes - last_tx_bytes
+                             ELSE excluded.last_tx_bytes END,
+                           last_rx_bytes = excluded.last_rx_bytes,
+                           last_tx_bytes = excluded.last_tx_bytes",
+                    )
+                    .bind(route_id)
+                    .bind(&s.node_id)
+                    .bind(rx)
+                    .bind(tx_bytes)
+                    .bind(rx)
+                    .bind(tx_bytes)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
         }
         tx.commit().await?;
@@ -175,6 +217,23 @@ impl<'a> StatsRepo<'a> {
             Some((rx, tx)) => (rx.unwrap_or(0), tx.unwrap_or(0)),
             None => (0, 0),
         })
+    }
+
+    /// 每条线路的累计流量，跨组内所有机器求和。
+    ///
+    /// 一次查询取全部线路，而不是逐条查：线路列表有几十上百条时，逐条查会让一次
+    /// 页面加载打出同样数量的 SQL。
+    pub async fn route_lifetime_totals(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT route_id, SUM(total_rx_bytes), SUM(total_tx_bytes)
+             FROM route_traffic_totals
+             GROUP BY route_id",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(id, rx, tx)| (id, (rx, tx))).collect())
     }
 
     pub async fn node_lifetime_totals(&self, node_id: &str) -> Result<(i64, i64)> {
@@ -629,6 +688,219 @@ mod tests {
         assert_eq!((routes[0].rx_bytes, routes[0].tx_bytes), (105, 77));
         assert_eq!(routes[1].route_id, "route-two");
         assert_eq!((routes[1].rx_bytes, routes[1].tx_bytes), (10, 20));
+    }
+
+    /// 一个组、两台入口机、一条直连线路。返回 (db, 机器 a, 机器 b, 线路 id)。
+    async fn route_fixture() -> (Database, String, String, String) {
+        let db = Database::connect_in_memory().await.unwrap();
+        let group = test_group(&db, "入口组", "inbound").await;
+        let nodes = NodeRepo::new(&db);
+        let mut ids = Vec::new();
+        for name in ["sh-01", "sh-02"] {
+            ids.push(
+                nodes
+                    .create(CreateNode {
+                        group_id: group.clone(),
+                        name: name.into(),
+                        region: "cn".into(),
+                        role: "entry".into(),
+                        public_address: None,
+                        management_address: None,
+                        note: None,
+                    })
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        let route = crate::routes::RouteRepo::new(&db)
+            .create(crate::models::CreateRoute {
+                name: "直连".into(),
+                mode: "direct".into(),
+                entry_group_id: group,
+                listen_address: "0.0.0.0".into(),
+                listen_port: Some(443),
+                exit_group_id: None,
+                target_host: "1.2.3.4".into(),
+                target_port: 443,
+                targets: vec![],
+                target_strategy: "random".into(),
+                endpoint_ids: vec![],
+                tunnel_pool_size: 8,
+                load_balance: "round_robin".into(),
+                max_connections: 0,
+                egress_source_ip: None,
+                egress_interface: None,
+            })
+            .await
+            .unwrap();
+        (db, ids.remove(0), ids.remove(0), route.id)
+    }
+
+    fn route_sample(node_id: &str, route_id: &str, rx: i64, tx: i64) -> StatSample {
+        StatSample {
+            route_id: Some(route_id.into()),
+            ..sample(node_id, rx, tx)
+        }
+    }
+
+    #[tokio::test]
+    async fn route_totals_survive_an_agent_restart() {
+        // 用户报告的原始症状：重启入口机后线路的累计流量被清零。
+        let (db, a, _, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+
+        // 计数器涨到 500，agent 重启归零后又涨到 80。
+        for (rx, tx) in [(100, 10), (300, 30), (500, 50), (0, 0), (80, 8)] {
+            repo.record_batch(&[route_sample(&a, &route, rx, tx)])
+                .await
+                .unwrap();
+        }
+
+        let totals = repo.route_lifetime_totals().await.unwrap();
+        assert_eq!(
+            totals.get(&route),
+            Some(&(580, 58)),
+            "重启前的 500 加上重启后的 80，不该因为计数器归零而丢失"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_machines_on_one_route_do_not_corrupt_each_others_counters() {
+        // 一条线路跑在组内两台机器上，各有独立计数器。回退检测若按线路而非按机器
+        // 做，A 的 1000 与 B 的 200 交替上报会被当成反复「重启」，总量被严重高估。
+        let (db, a, b, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+
+        for (ra, rb) in [(1000, 200), (1100, 250), (1200, 300)] {
+            repo.record_batch(&[
+                route_sample(&a, &route, ra, 0),
+                route_sample(&b, &route, rb, 0),
+            ])
+            .await
+            .unwrap();
+        }
+
+        let (rx, _) = repo.route_lifetime_totals().await.unwrap()[&route];
+        // A 共 1200，B 共 300。若按线路记账，这里会得到数千。
+        assert_eq!(rx, 1500, "两台机器的计数器互相干扰了");
+    }
+
+    #[tokio::test]
+    async fn one_machine_restarting_does_not_affect_the_other() {
+        let (db, a, b, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+
+        repo.record_batch(&[route_sample(&a, &route, 400, 0), route_sample(&b, &route, 100, 0)])
+            .await
+            .unwrap();
+        // 只有 A 重启了。
+        repo.record_batch(&[route_sample(&a, &route, 30, 0), route_sample(&b, &route, 150, 0)])
+            .await
+            .unwrap();
+
+        let (rx, _) = repo.route_lifetime_totals().await.unwrap()[&route];
+        assert_eq!(rx, 400 + 30 + 150);
+    }
+
+    #[tokio::test]
+    async fn route_totals_survive_sample_pruning() {
+        // 历史样本按保留期清理，累计总量不该跟着变小。
+        let (db, a, _, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+        for rx in [100, 200, 300] {
+            repo.record_batch(&[route_sample(&a, &route, rx, 0)])
+                .await
+                .unwrap();
+        }
+
+        sqlx::query("UPDATE traffic_stats SET bucket_at = '2000-01-01T00:00:00+00:00'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        repo.prune(1).await.unwrap();
+        assert_eq!(repo.count().await.unwrap(), 0, "测试前提：样本已被清空");
+
+        assert_eq!(repo.route_lifetime_totals().await.unwrap()[&route], (300, 0));
+    }
+
+    #[tokio::test]
+    async fn route_totals_outlive_a_deleted_machine() {
+        // 删掉一台下线的机器，它贡献过的历史流量仍然属于这条线路。账本表没有
+        // 外键级联正是为此 —— traffic_stats 是级联的，账本不能跟着它走。
+        let (db, a, b, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+        repo.record_batch(&[route_sample(&a, &route, 700, 0), route_sample(&b, &route, 300, 0)])
+            .await
+            .unwrap();
+
+        NodeRepo::new(&db).delete(&b).await.unwrap();
+
+        assert_eq!(
+            repo.route_lifetime_totals().await.unwrap()[&route].0,
+            1000,
+            "删除机器抹掉了它贡献的历史流量"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_route_removes_only_its_ledger_rows() {
+        // 账本表没有外键级联，清理由 RouteRepo::delete 在同一事务里完成。
+        // 走真实的删除入口来测，而不是单独调一个清理函数 —— 要验证的恰恰是
+        // 「删线路时会不会顺带清账本」。
+        let (db, a, _, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+        repo.record_batch(&[route_sample(&a, &route, 100, 0)])
+            .await
+            .unwrap();
+        // 手工插一行别的线路的账本，确认不被误删。
+        sqlx::query(
+            "INSERT INTO route_traffic_totals (route_id, node_id, total_rx_bytes)
+             VALUES ('other-route', ?, 42)",
+        )
+        .bind(&a)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        crate::routes::RouteRepo::new(&db).delete(&route).await.unwrap();
+
+        let totals = repo.route_lifetime_totals().await.unwrap();
+        assert!(!totals.contains_key(&route), "删线路后账本行残留");
+        assert_eq!(totals.get("other-route"), Some(&(42, 0)), "误删了别的线路");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_route_leaves_the_ledger_untouched() {
+        // NotFound 必须在清理账本之前返回，否则一次删错 id 的请求会连带清掉
+        // 一条同名残留行 —— 事务没提交，但这里确认一下行为。
+        let (db, a, _, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+        repo.record_batch(&[route_sample(&a, &route, 100, 0)])
+            .await
+            .unwrap();
+
+        let err = crate::routes::RouteRepo::new(&db)
+            .delete("no-such-route")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::db::DbError::NotFound(_)), "{err:?}");
+        assert_eq!(repo.route_lifetime_totals().await.unwrap()[&route], (100, 0));
+    }
+
+    #[tokio::test]
+    async fn node_rollups_do_not_leak_into_route_totals() {
+        // 机器级样本（route_id 为空）只进 node_traffic_totals。
+        let (db, a, _, route) = route_fixture().await;
+        let repo = StatsRepo::new(&db);
+        repo.record_batch(&[sample(&a, 9999, 9999), route_sample(&a, &route, 10, 20)])
+            .await
+            .unwrap();
+
+        let totals = repo.route_lifetime_totals().await.unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[&route], (10, 20));
+        assert_eq!(repo.node_lifetime_totals(&a).await.unwrap(), (9999, 9999));
     }
 
     #[tokio::test]

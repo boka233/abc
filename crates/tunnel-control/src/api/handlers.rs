@@ -549,17 +549,111 @@ pub async fn list_routes(
     let cfg = state.config();
     let stale = std::time::Duration::from_secs(cfg.agent.stale_after_secs);
 
+    // 累计流量从持久化账本取，一次查询拿全部线路。
+    //
+    // 不能用实时上报里的 rx_bytes/tx_bytes：那是 agent 进程内存里的计数器，进程
+    // 一重启就归零，面板上的累计流量会跟着清零。账本按增量累加并处理计数器回退，
+    // 跨越重启与样本清理都不会丢。
+    let lifetime = StatsRepo::new(&state.db).route_lifetime_totals().await?;
+
     // 一条线路的入口组里可能有多台机器，各自都在转发这条线路，所以实时数据要跨
     // 机器求和，而不是取某一台的读数。
     let nodes = NodeRepo::new(&state.db);
     let mut enriched = Vec::with_capacity(routes.len());
     for r in routes {
         let members = nodes.list_for_group(&r.entry_group_id).await?;
-        let live = aggregate_route_live(&state, &members, &r.id, stale);
+        let mut live = aggregate_route_live(&state, &members, &r.id, stale);
+        apply_lifetime_totals(&mut live, lifetime.get(&r.id).copied());
         enriched.push(serde_json::json!({ "route": r, "live": live }));
     }
 
     Ok(Json(serde_json::json!({ "routes": enriched })))
+}
+
+/// 一台机器的公网 v4 / v6 地址，各取一个。
+///
+/// 优先级：控制面实际看到的来源地址 > 登记的公网地址 > 管理地址 > 网卡上的地址。
+///
+/// 这是**唯一**的选取规则。心跳里用它决定查哪个 IP 的地区，组详情接口用它决定
+/// 下发哪个 IP 与地区 —— 面板直接显示下发的结果，不再自己重算。以前前端有一份
+/// 独立的同名规则，两边一旦漂移，查的与显示的就不是同一个 IP。
+///
+/// 来源地址排第一：它是真正从公网连进来的那个，网卡上的地址在 NAT 后面可能只是内网。
+pub(crate) fn candidate_public_ips(
+    observed: Option<std::net::IpAddr>,
+    public_address: Option<&str>,
+    management_address: Option<&str>,
+    interfaces: &[tunnel_common::model::InterfaceInfo],
+) -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+
+    let registered = public_address.and_then(|s| s.trim().parse::<IpAddr>().ok());
+    let managed = management_address.and_then(|s| s.trim().parse::<IpAddr>().ok());
+    let from_nics = interfaces
+        .iter()
+        .filter(|i| !i.is_loopback)
+        .flat_map(|i| i.addresses.iter().copied());
+
+    let ordered = observed
+        .into_iter()
+        .chain(registered)
+        .chain(managed)
+        .chain(from_nics);
+
+    let mut v4: Option<IpAddr> = None;
+    let mut v6: Option<IpAddr> = None;
+    for ip in ordered.filter(|ip| crate::geo::is_public(*ip)) {
+        match ip {
+            IpAddr::V4(_) if v4.is_none() => v4 = Some(ip),
+            IpAddr::V6(_) if v6.is_none() => v6 = Some(ip),
+            _ => {}
+        }
+        if v4.is_some() && v6.is_some() {
+            break;
+        }
+    }
+    v4.into_iter().chain(v6).collect()
+}
+
+/// 用持久化账本里的累计流量覆盖实时数据里的 rx_bytes / tx_bytes。
+///
+/// 实时数据里那两个字段是 agent 进程内存里的计数器，重启即归零；账本才是跨越重启
+/// 的真实总量。
+///
+/// 所有机器都离线时 `live` 是 `None` —— 以前这没问题，没有东西可显示。但现在账本里
+/// 有历史总量，一条暂时没有机器在线的线路不该显示成「0 流量」，那会让人以为数据
+/// 丢了。所以此时构造一个只含累计流量、其余全为零的对象。
+fn apply_lifetime_totals(live: &mut Option<serde_json::Value>, totals: Option<(i64, i64)>) {
+    let Some((rx, tx)) = totals else {
+        return;
+    };
+    let rx = rx.max(0);
+    let tx = tx.max(0);
+    match live {
+        Some(value) => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("rx_bytes".into(), serde_json::json!(rx));
+                obj.insert("tx_bytes".into(), serde_json::json!(tx));
+            }
+        }
+        None => {
+            *live = Some(serde_json::json!({
+                "rx_bytes": rx,
+                "tx_bytes": tx,
+                "connections": 0,
+                "rx_bps": 0,
+                "tx_bps": 0,
+                "tunnels_online": 0,
+                "tunnels_total": 0,
+                "accepted_total": 0,
+                "rejected_total": 0,
+                "failed_total": 0,
+                "active_endpoint_id": null,
+                "reporting_machines": 0,
+                "targets": [],
+            }));
+        }
+    }
 }
 
 /// 一个目标在整组机器上的汇总健康状态。
@@ -719,7 +813,9 @@ pub async fn get_route(
         }
     }
 
-    let live = aggregate_route_live(&state, &members, &id, stale);
+    let mut live = aggregate_route_live(&state, &members, &id, stale);
+    let lifetime = StatsRepo::new(&state.db).route_lifetime_totals().await?;
+    apply_lifetime_totals(&mut live, lifetime.get(&id).copied());
     Ok(Json(serde_json::json!({
         "route": route,
         "tunnels": tunnels,
@@ -1357,6 +1453,20 @@ pub async fn agent_heartbeat(
         last_heartbeat_at: None,
     };
 
+    // 地区查询：在后台发起，不等结果。
+    //
+    // 候选地址与面板显示「节点 IP」用的是同一组来源（控制面看到的来源地址、机器登记
+    // 的公网地址、网卡地址），这样服务端查的正是面板要显示的那几个。已查过的 IP
+    // 在缓存里命中后直接返回，所以绝大多数心跳在这里只做内存判断。
+    for ip in candidate_public_ips(
+        client.0,
+        agent.node.public_address.as_deref(),
+        agent.node.management_address.as_deref(),
+        &report.interfaces,
+    ) {
+        state.geo.refresh_in_background(state.db.clone(), ip);
+    }
+
     NodeRepo::new(&state.db).record_heartbeat(status).await?;
     state.ingest_report(&agent.node.name, report);
 
@@ -1502,5 +1612,135 @@ mod tests {
         // 隧道线路的目标由出口拨号，入口侧报空列表 —— 不该变成一个假的目标。
         assert!(merge_target_health(&[vec![], vec![]]).is_empty());
         assert!(merge_target_health(&[]).is_empty());
+    }
+
+    #[test]
+    fn lifetime_totals_replace_the_volatile_live_counters() {
+        // 实时数据里的字节数是 agent 内存计数器，重启后变小；账本才是真实总量。
+        let mut live = Some(serde_json::json!({
+            "rx_bytes": 80,
+            "tx_bytes": 8,
+            "connections": 5,
+            "rx_bps": 1000,
+        }));
+        apply_lifetime_totals(&mut live, Some((580, 58)));
+        let v = live.unwrap();
+        assert_eq!(v["rx_bytes"], 580);
+        assert_eq!(v["tx_bytes"], 58);
+        // 其余实时字段保持不动。
+        assert_eq!(v["connections"], 5);
+        assert_eq!(v["rx_bps"], 1000);
+    }
+
+    #[test]
+    fn a_route_with_no_machine_online_still_shows_its_history() {
+        // 所有机器离线时 aggregate_route_live 返回 None。以前面板据此显示 0 流量；
+        // 现在账本里有历史，显示 0 会让人以为数据丢了。
+        let mut live = None;
+        apply_lifetime_totals(&mut live, Some((1_000, 2_000)));
+        let v = live.expect("有历史流量时应构造出实时对象");
+        assert_eq!(v["rx_bytes"], 1_000);
+        assert_eq!(v["tx_bytes"], 2_000);
+        // 没有机器在线，实时指标一律为零，不能是凭空编的数。
+        assert_eq!(v["connections"], 0);
+        assert_eq!(v["rx_bps"], 0);
+        assert_eq!(v["reporting_machines"], 0);
+    }
+
+    #[test]
+    fn a_route_without_a_ledger_row_is_left_as_is() {
+        // 新建、还没转发过任何流量的线路在账本里没有行，不该被改写成 0。
+        let mut offline = None;
+        apply_lifetime_totals(&mut offline, None);
+        assert!(offline.is_none());
+
+        let mut online = Some(serde_json::json!({ "rx_bytes": 7, "tx_bytes": 9 }));
+        apply_lifetime_totals(&mut online, None);
+        assert_eq!(online.unwrap()["rx_bytes"], 7);
+    }
+
+    fn nic(addrs: &[&str], loopback: bool) -> tunnel_common::model::InterfaceInfo {
+        tunnel_common::model::InterfaceInfo {
+            name: "eth0".into(),
+            addresses: addrs.iter().map(|a| a.parse().unwrap()).collect(),
+            is_loopback: loopback,
+            is_up: true,
+        }
+    }
+
+    #[test]
+    fn the_observed_address_wins_over_everything_else() {
+        // NAT 后面的机器网卡上只有内网地址，控制面看到的来源地址才是真实公网地址。
+        let ips = candidate_public_ips(
+            Some("151.244.134.139".parse().unwrap()),
+            Some("8.8.8.8"),
+            None,
+            &[nic(&["1.1.1.1"], false)],
+        );
+        assert_eq!(ips, vec!["151.244.134.139".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn a_private_observed_address_falls_through_to_the_next_source() {
+        // 反代在同一内网时，来源地址是 10.x —— 不该拿它去查地区。
+        let ips = candidate_public_ips(
+            Some("10.0.0.5".parse().unwrap()),
+            Some("203.0.113.9"), // 文档网段，同样不是公网
+            Some("151.244.134.139"),
+            &[],
+        );
+        assert_eq!(ips, vec!["151.244.134.139".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn one_v4_and_one_v6_are_picked_independently() {
+        let ips = candidate_public_ips(
+            Some("151.244.134.139".parse().unwrap()),
+            None,
+            None,
+            &[nic(&["192.168.1.2", "2606:4700::1111", "2606:4700::2222"], false)],
+        );
+        assert_eq!(ips.len(), 2);
+        assert!(ips[0].is_ipv4());
+        assert_eq!(ips[1].to_string(), "2606:4700::1111", "应取第一个公网 v6");
+    }
+
+    #[test]
+    fn loopback_interfaces_are_ignored() {
+        let ips = candidate_public_ips(None, None, None, &[nic(&["8.8.8.8"], true)]);
+        assert!(ips.is_empty(), "回环网卡上的地址不该被采用");
+    }
+
+    #[test]
+    fn garbage_registered_addresses_do_not_panic() {
+        // 登记地址是人手填的，可能是域名、带端口、或纯垃圾。
+        let ips = candidate_public_ips(
+            None,
+            Some("panel.example.com"),
+            Some("1.2.3.4:8080"),
+            &[nic(&["8.8.8.8"], false)],
+        );
+        assert_eq!(ips, vec!["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn a_machine_with_no_public_address_yields_nothing_to_look_up() {
+        let ips = candidate_public_ips(
+            Some("10.0.0.1".parse().unwrap()),
+            None,
+            None,
+            &[nic(&["172.16.0.2", "fd00::1"], false)],
+        );
+        assert!(ips.is_empty(), "纯内网机器不该触发任何外部查询");
+    }
+
+    #[test]
+    fn negative_ledger_values_are_clamped() {
+        // 账本是 i64，手工改库或溢出时可能出现负数；面板上显示负流量毫无意义。
+        let mut live = None;
+        apply_lifetime_totals(&mut live, Some((-5, -1)));
+        let v = live.unwrap();
+        assert_eq!(v["rx_bytes"], 0);
+        assert_eq!(v["tx_bytes"], 0);
     }
 }

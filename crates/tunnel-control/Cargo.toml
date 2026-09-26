@@ -36,6 +36,12 @@ clap = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 futures-util = { workspace = true }
+# IP 地区查询（src/geo.rs）用的 HTTPS 客户端。这几个早就是 workspace 依赖、
+# agent 也在用，这里只是声明出来，不给依赖树增加任何新 crate。
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

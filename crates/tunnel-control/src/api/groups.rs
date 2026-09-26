@@ -262,8 +262,7 @@ pub struct InstallCommandResponse {
 
 /// 返回该组的一键对接命令。
 ///
-/// 每次调用都会轮换令牌吗？不会。轮换是显式操作，否则管理员为了看一眼命令就会
-/// 把已部署机器的凭据作废。这里返回的是**新签发**的一次性令牌 —— 见下方说明。
+/// 每次调用都会签发一个新令牌，旧机器继续使用自己的令牌。
 pub async fn install_command(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -272,10 +271,8 @@ pub async fn install_command(
 ) -> ApiResult<Json<InstallCommandResponse>> {
     user.require_admin()?;
 
-    // 组令牌只有哈希，无法还原明文，所以「查看安装命令」必须重新签发一个令牌。
-    // 这是刻意的取舍：要么明文存令牌（数据库泄露即凭据泄露），要么每次查看都轮换。
-    // 选后者，并在响应里说清旧令牌已失效。
-    let token = DeviceGroupRepo::new(&state.db).rotate_token(&id).await?;
+    // 只存哈希，无法取回旧命令；新令牌与旧令牌并行有效。
+    let token = DeviceGroupRepo::new(&state.db).issue_token(&id).await?;
     let group = DeviceGroupRepo::new(&state.db).get(&id).await?;
 
     audit(
@@ -339,7 +336,7 @@ pub async fn rotate_group_token(
     Ok(Json(serde_json::json!({
         "enroll_token": token,
         "install_command": install_command_for(&state, &token),
-        "note": "旧令牌已失效。组内已在线的机器不会掉线，但重装或新增机器需使用新命令。"
+        "note": "组内所有旧令牌已失效；请更新每台机器配置中的 enroll_token 并重启 agent。"
     })))
 }
 

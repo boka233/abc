@@ -547,6 +547,17 @@ esac
 
 readonly AGENT_DEST="/var/lib/tunnel-control/agent-bin/tunnel-agent-$ASSET_ARCH"
 
+# 控制面的数据卷会保留旧 agent。只检查文件存在会让新版面板继续给新节点
+# 分发旧二进制；本机 target/release 也可能是上次编译留下的旧版本。
+agent_matches_release_version() {
+    local actual
+    actual="$("$1" --version 2>/dev/null || true)"
+    if [[ "$actual" != "tunnel-agent $VERSION" ]]; then
+        warn "agent 版本不匹配：期望 $VERSION，实际 ${actual:-无法运行}（来源：$1）"
+        return 1
+    fi
+}
+
 # 从 Release 下载并校验。成功返回 0。
 download_agent_from_release() {
     local slug="$1" version="$2" arch="$3" out="$4"
@@ -574,11 +585,14 @@ download_agent_from_release() {
         warn "  实际 $actual"
         return 1
     fi
+    chmod 700 "$out"
+    agent_matches_release_version "$out" || return 1
     ok "已下载并校验 tunnel-agent-$arch（sha256 ${actual:0:16}…）"
     return 0
 }
 
 place_agent() {
+    agent_matches_release_version "$1" || return 1
     docker exec -u 0 tunnel-control install -d -o tunnel -g tunnel -m 755 \
         /var/lib/tunnel-control/agent-bin || return 1
     docker cp "$1" "tunnel-control:$AGENT_DEST" || return 1
@@ -606,8 +620,10 @@ else
 
     # --- 2. 本机已编译的 ---
     if [[ "$PLACED" == "no" && -x "$REPO_ROOT/target/release/tunnel-agent" ]]; then
-        info "改用本机 target/release/tunnel-agent"
-        place_agent "$REPO_ROOT/target/release/tunnel-agent" && PLACED="yes"
+        info "尝试本机 target/release/tunnel-agent"
+        if agent_matches_release_version "$REPO_ROOT/target/release/tunnel-agent"; then
+            place_agent "$REPO_ROOT/target/release/tunnel-agent" && PLACED="yes"
+        fi
     fi
 
     # --- 3. Docker build 阶段 ---
@@ -630,6 +646,12 @@ else
 
     rm -f "$TMP_AGENT"
     [[ "$PLACED" == "yes" ]] && ok "已放置 $AGENT_DEST"
+fi
+
+if [[ "$ASSET_ARCH" != "" ]]; then
+    INSTALLED_VERSION="$(docker exec -u tunnel tunnel-control "$AGENT_DEST" --version 2>/dev/null || true)"
+    [[ "$INSTALLED_VERSION" == "tunnel-agent $VERSION" ]] \
+        || die "控制面仍在提供 ${INSTALLED_VERSION:-无法运行的} agent；当前仓库版本是 $VERSION。请检查上方下载或构建错误后重跑部署脚本。"
 fi
 
 if ! docker exec -u tunnel tunnel-control test -s "$AGENT_DEST" >/dev/null 2>&1 \

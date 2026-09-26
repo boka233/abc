@@ -55,8 +55,8 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .patch(groups::update_group)
                 .delete(groups::delete_group),
         )
-        // 一键对接命令。GET 会轮换令牌（只有哈希，无法还原明文），响应里说明这点。
-        .route("/groups/{id}/install-command", get(groups::install_command))
+        // 签发新的一键对接命令；保留已部署机器使用的令牌。
+        .route("/groups/{id}/install-command", post(groups::install_command))
         .route("/groups/{id}/token", post(groups::rotate_group_token))
         .route(
             "/groups/{group_id}/machines/{node_id}",
@@ -100,6 +100,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/tunnels", get(handlers::list_tunnels))
         .route("/connections", get(handlers::list_connections))
         .route("/traffic", get(handlers::traffic))
+        .route("/traffic/daily", get(handlers::daily_traffic))
         // --- administration ---
         .route("/logs/audit", get(handlers::audit_logs))
         .route(
@@ -348,6 +349,11 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(digest.len(), 64, "sha256 应为 64 位十六进制: {digest}");
+        assert_eq!(
+            response.headers()[super::download::VERSION_HEADER],
+            env!("CARGO_PKG_VERSION"),
+            "一键脚本需要控制面的版本来拒绝旧 agent"
+        );
 
         let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
         assert_eq!(&body[..], b"fake-binary-contents");

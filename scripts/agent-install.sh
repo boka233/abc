@@ -189,6 +189,16 @@ if curl -fsSL --connect-timeout 10 -D "$TMP_HDR" -o "$TMP_BIN" "$BIN_URL" 2>/dev
         warn "面板未提供 sha256 校验值（控制面版本较旧），本次下载未经校验"
     fi
 
+    EXPECTED_VERSION="$(tr -d '\r' < "$TMP_HDR" \
+        | awk 'tolower($1) == "x-binary-version:" { print $2 }' \
+        | tail -n 1)"
+    [[ -n "$EXPECTED_VERSION" ]] \
+        || die "面板未提供 agent 版本信息，请先升级控制面，再重新对接节点"
+    chmod 700 "$TMP_BIN"
+    DOWNLOADED_VERSION="$("$TMP_BIN" --version 2>/dev/null || true)"
+    [[ "$DOWNLOADED_VERSION" == "tunnel-agent $EXPECTED_VERSION" ]] \
+        || die "面板提供的 agent 版本不匹配：控制面 $EXPECTED_VERSION，下载到 ${DOWNLOADED_VERSION:-无法运行}。请重跑控制面部署脚本刷新 agent 二进制"
+
     install -m 755 "$TMP_BIN" "$BIN_DIR/tunnel-agent"
     ok "已从面板安装 $BIN_DIR/tunnel-agent"
 elif [[ -x "$BIN_DIR/tunnel-agent" ]]; then

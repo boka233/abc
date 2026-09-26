@@ -21,9 +21,9 @@ const REL: Ordering = Ordering::Relaxed;
 /// Byte and connection counters, shared by clone-of-Arc.
 #[derive(Debug, Default)]
 pub struct Counters {
-    /// Bytes travelling client → target.
+    /// Bytes received by this component. On an entry relay: client → target.
     pub rx_bytes: AtomicU64,
-    /// Bytes travelling target → client.
+    /// Bytes sent by this component. On an entry relay: target → client.
     pub tx_bytes: AtomicU64,
     /// Currently established connections/streams.
     pub active: AtomicU32,

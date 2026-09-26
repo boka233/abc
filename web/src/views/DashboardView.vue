@@ -67,12 +67,12 @@ const txBps = computed(() => live.value?.tx_bps ?? stats.value?.tx_bps ?? 0)
       <div class="card-sub">正在转发</div>
     </div>
     <div class="card">
-      <div class="card-label">下行</div>
+      <div class="card-label">接收</div>
       <div class="card-value">{{ bitrate(rxBps) }}</div>
       <div class="card-sub">累计 {{ bytes(stats?.total_rx_bytes ?? 0) }}</div>
     </div>
     <div class="card">
-      <div class="card-label">上行</div>
+      <div class="card-label">发送</div>
       <div class="card-value">{{ bitrate(txBps) }}</div>
       <div class="card-sub">累计 {{ bytes(stats?.total_tx_bytes ?? 0) }}</div>
     </div>

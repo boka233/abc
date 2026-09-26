@@ -87,12 +87,12 @@ function label(value: number): string {
     <div v-if="series" class="legend">
       <span class="legend-item">
         <span class="legend-swatch" style="background: var(--accent)"></span>
-        {{ mode === 'rate' ? 'Download' : 'Connections' }}
+        {{ mode === 'rate' ? '接收' : '连接数' }}
         <strong>{{ label(series.latestRx) }}</strong>
       </span>
       <span v-if="series.txPath" class="legend-item">
         <span class="legend-swatch" style="background: var(--ok)"></span>
-        Upload <strong>{{ label(series.latestTx) }}</strong>
+        发送 <strong>{{ label(series.latestTx) }}</strong>
       </span>
       <span class="legend-item dim">peak {{ label(series.peak) }}</span>
     </div>

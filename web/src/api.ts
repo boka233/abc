@@ -297,6 +297,22 @@ export interface TrafficPoint {
   connections: number
 }
 
+export interface DailyRouteTraffic {
+  route_id: string
+  route_name: string
+  rx_bytes: number
+  tx_bytes: number
+}
+
+export interface DailyTrafficDto {
+  date: string
+  utc_offset_minutes: number
+  rx_bytes: number
+  tx_bytes: number
+  total_bytes: number
+  routes: DailyRouteTraffic[]
+}
+
 export interface AuditRow {
   id: number
   at: string

@@ -176,6 +176,7 @@ mod tests {
         for table in [
             "users",
             "device_groups",
+            "device_group_tokens",
             "nodes",
             "node_status",
             "endpoints",

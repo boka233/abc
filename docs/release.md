@@ -81,8 +81,9 @@ bash <(curl -fsSL http://面板:8080/api/agent/install.sh) -t <令牌> -u http:/
 
 1. 脚本从 `/api/agent/download/tunnel-agent-<架构>` 下载二进制
 2. 校验 sha256（面板在 `X-Binary-Sha256` 响应头里给出）
-3. 写 `/etc/tunnel-agent/config.toml`，装 systemd 服务并启动
-4. agent 凭组令牌向控制面注册，控制面按 (组, 机器名) 登记并回传 node_id
+3. 核对下载文件的 `--version` 与控制面的 `X-Binary-Version` 是否一致；版本不匹配时停止安装，并提示重跑控制面部署脚本刷新持久化的 agent 文件
+4. 写 `/etc/tunnel-agent/config.toml`，装 systemd 服务并启动
+5. agent 凭组令牌向控制面注册，控制面按 (组, 机器名) 登记并回传 node_id
 
 **第 1 步依赖控制面配置了 `agent_binary_dir`**，默认
 `/var/lib/tunnel-control/agent-bin`。发布包的 `install.sh` 装控制面时会自动把
@@ -116,6 +117,8 @@ chown tunnel:tunnel /var/lib/tunnel-control/agent-bin/tunnel-agent-aarch64
 
 **先控制面，再逐台 agent。** 两侧容忍同一协议大版本内的版本差异；真正不兼容时会在
 握手处被明确拒绝，而不是猜着跑。
+已运行的节点可以逐台升级；新节点的一键脚本要求控制面提供当前版本的 agent，
+避免持久化下载目录中的旧文件反复安装到新机器。
 
 ```bash
 # 控制面
@@ -156,7 +159,7 @@ sqlite3 /var/lib/tunnel-control/control.db ".backup '/backup/control-升级前.d
 ```
 
 判断某个版本有没有引入迁移：看 `migrations/` 目录下的文件是否有新增。当前已有
-0001-0005。
+0001-0007。升级 v0.1.4 前请先备份数据库；本次新增 0006、0007。
 
 ## 发布前自查
 

@@ -829,13 +829,15 @@ mod tests {
 
         let upstream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut client, client_side) = duplex(64 * 1024);
+        let counters = Counters::new();
+        let relay_counters = counters.clone();
         tokio::spawn(async move {
             relay_sockets(
                 client_side,
                 upstream,
                 16 * 1024,
                 Duration::ZERO,
-                Counters::new(),
+                relay_counters,
                 None,
             )
             .await
@@ -851,6 +853,8 @@ mod tests {
             .expect("目标从未看到 EOF，半关闭没有传播")
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&reply), "收到 10 字节");
+        assert_eq!(counters.rx(), 10, "接收记录客户端发往目标的字节");
+        assert_eq!(counters.tx(), reply.len() as u64, "发送记录目标返回的字节");
     }
 
     #[tokio::test]

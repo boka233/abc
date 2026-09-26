@@ -18,6 +18,16 @@
 
 use crate::db::{now_string, Database, Result};
 use crate::models::TrafficPoint;
+use serde::Serialize;
+use sqlx::FromRow;
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct DailyRouteTraffic {
+    pub route_id: String,
+    pub route_name: String,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
 
 /// One node's counters at a point in time.
 #[derive(Debug, Clone)]
@@ -151,6 +161,66 @@ impl<'a> StatsRepo<'a> {
             Some((rx, tx)) => (rx.unwrap_or(0), tx.unwrap_or(0)),
             None => (0, 0),
         })
+    }
+
+    /// One local calendar day's traffic per route, using UTC boundaries supplied
+    /// by the caller. Route snapshots come from entry nodes, so the same tunneled
+    /// bytes are not counted again on the exit node.
+    ///
+    /// Counters are cumulative. Each sample contributes its difference from the
+    /// preceding sample of that node and route, including the sample before the
+    /// day starts. A reset contributes the new counter value. Without a preceding
+    /// sample, the first reading is a baseline rather than traffic for this day.
+    pub async fn daily_routes(
+        &self,
+        start_utc: &str,
+        end_utc: &str,
+    ) -> Result<Vec<DailyRouteTraffic>> {
+        let rows = sqlx::query_as::<_, DailyRouteTraffic>(
+            "WITH daily AS (
+                 SELECT node_id, route_id, rx_bytes, tx_bytes,
+                        LAG(rx_bytes) OVER sequence AS previous_rx,
+                        LAG(tx_bytes) OVER sequence AS previous_tx
+                 FROM traffic_stats
+                 WHERE route_id IS NOT NULL AND bucket_at >= ? AND bucket_at < ?
+                 WINDOW sequence AS (
+                     PARTITION BY node_id, route_id ORDER BY bucket_at, id
+                 )
+             ), with_baseline AS (
+                 SELECT daily.*,
+                        CASE WHEN previous_rx IS NULL THEN (
+                            SELECT p.rx_bytes FROM traffic_stats p
+                            WHERE p.node_id = daily.node_id AND p.route_id = daily.route_id
+                              AND p.bucket_at < ?
+                            ORDER BY p.bucket_at DESC, p.id DESC LIMIT 1
+                        ) ELSE previous_rx END AS baseline_rx,
+                        CASE WHEN previous_tx IS NULL THEN (
+                            SELECT p.tx_bytes FROM traffic_stats p
+                            WHERE p.node_id = daily.node_id AND p.route_id = daily.route_id
+                              AND p.bucket_at < ?
+                            ORDER BY p.bucket_at DESC, p.id DESC LIMIT 1
+                        ) ELSE previous_tx END AS baseline_tx
+                 FROM daily
+             )
+             SELECT r.id AS route_id, r.name AS route_name,
+                    SUM(CASE WHEN d.baseline_rx IS NULL THEN 0
+                             WHEN d.rx_bytes >= d.baseline_rx THEN d.rx_bytes - d.baseline_rx
+                             ELSE d.rx_bytes END) AS rx_bytes,
+                    SUM(CASE WHEN d.baseline_tx IS NULL THEN 0
+                             WHEN d.tx_bytes >= d.baseline_tx THEN d.tx_bytes - d.baseline_tx
+                             ELSE d.tx_bytes END) AS tx_bytes
+             FROM with_baseline d JOIN routes r ON r.id = d.route_id
+             GROUP BY r.id, r.name
+             HAVING rx_bytes > 0 OR tx_bytes > 0
+             ORDER BY rx_bytes + tx_bytes DESC, r.name",
+        )
+        .bind(start_utc)
+        .bind(end_utc)
+        .bind(start_utc)
+        .bind(start_utc)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows)
     }
 
     /// Drop buckets older than `days`. Returns the number of rows removed.
@@ -424,6 +494,100 @@ mod tests {
     async fn lifetime_totals_on_an_empty_table_are_zero() {
         let (db, _) = fixture().await;
         assert_eq!(StatsRepo::new(&db).lifetime_totals().await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn daily_routes_use_deltas_across_midnight_and_counter_resets() {
+        let (db, node_id) = fixture().await;
+        let (group_id,): (String,) = sqlx::query_as("SELECT group_id FROM nodes WHERE id = ?")
+            .bind(&node_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for (id, port) in [("route-one", 5001), ("route-two", 5002)] {
+            sqlx::query(
+                "INSERT INTO routes
+                 (id, name, entry_group_id, exit_group_id, listen_address, listen_port,
+                  target_host, target_port, mode, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, '0.0.0.0', ?, '127.0.0.1', 443, 'direct', ?, ?)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(&group_id)
+            .bind(&group_id)
+            .bind(port)
+            .bind(now_string())
+            .bind(now_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let samples = [
+            ("2026-09-25T15:59:50+00:00", Some("route-one"), 100, 200),
+            ("2026-09-25T16:00:10+00:00", Some("route-one"), 130, 220),
+            ("2026-09-25T16:00:20+00:00", Some("route-one"), 180, 250),
+            ("2026-09-25T16:00:30+00:00", Some("route-one"), 5, 7),
+            ("2026-09-26T16:00:10+00:00", Some("route-one"), 50, 70),
+            ("2026-09-25T16:00:10+00:00", Some("route-two"), 10, 20),
+            ("2026-09-25T16:00:20+00:00", Some("route-two"), 20, 40),
+            ("2026-09-25T16:00:20+00:00", None, 9999, 9999),
+        ];
+        for (at, route_id, rx, tx) in samples {
+            sqlx::query(
+                "INSERT INTO traffic_stats
+                 (bucket_at, node_id, route_id, rx_bytes, tx_bytes)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(at)
+            .bind(&node_id)
+            .bind(route_id)
+            .bind(rx)
+            .bind(tx)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let second = NodeRepo::new(&db)
+            .create(CreateNode {
+                group_id,
+                name: "sh-02".into(),
+                region: "cn".into(),
+                role: "entry".into(),
+                public_address: None,
+                management_address: None,
+                note: None,
+            })
+            .await
+            .unwrap();
+        for (at, rx, tx) in [
+            ("2026-09-25T15:59:50+00:00", 30, 40),
+            ("2026-09-25T16:00:10+00:00", 50, 60),
+        ] {
+            sqlx::query(
+                "INSERT INTO traffic_stats
+                 (bucket_at, node_id, route_id, rx_bytes, tx_bytes)
+                 VALUES (?, ?, 'route-one', ?, ?)",
+            )
+            .bind(at)
+            .bind(&second.id)
+            .bind(rx)
+            .bind(tx)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let routes = StatsRepo::new(&db)
+            .daily_routes("2026-09-25T16:00:00+00:00", "2026-09-26T16:00:00+00:00")
+            .await
+            .unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].route_id, "route-one");
+        assert_eq!((routes[0].rx_bytes, routes[0].tx_bytes), (105, 77));
+        assert_eq!(routes[1].route_id, "route-two");
+        assert_eq!((routes[1].rx_bytes, routes[1].tx_bytes), (10, 20));
     }
 
     #[tokio::test]

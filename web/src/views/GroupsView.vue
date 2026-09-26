@@ -62,8 +62,9 @@ async function create() {
 
 async function showInstall(group: DeviceGroupDto) {
   try {
-    install.value = await api.get<InstallCommandDto>(
+    install.value = await api.post<InstallCommandDto>(
       `/groups/${group.id}/install-command`,
+      {},
     )
     installGroupName.value = group.name
   } catch (e) {
@@ -110,6 +111,9 @@ function kindClass(kind: string): string {
     设备组是入口或出口机器的集合。<strong>注册令牌挂在组上</strong>，所以同一条
     「一键对接」命令可以在多台机器上执行，它们会自动加入同一个组并领到相同的线路
     配置。换机器、加机器都不需要改动线路。
+    <br />
+    接收、发送是 agent 转发的应用数据方向。入口直连时分别是客户端→目标、目标→客户端；
+    它们不是 VPS 网卡总收发，数值不要求相等。
   </div>
 
   <div class="toolbar">
@@ -124,7 +128,7 @@ function kindClass(kind: string): string {
         <tr>
           <th>名称</th><th>类型</th><th>地区</th>
           <th class="num">机器</th><th class="num">连接数</th>
-          <th class="num">下行</th><th class="num">上行</th>
+          <th class="num">接收</th><th class="num">发送</th>
           <th>状态</th><th>备注</th><th></th>
         </tr>
       </thead>

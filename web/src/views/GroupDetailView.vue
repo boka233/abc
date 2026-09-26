@@ -80,11 +80,46 @@ const machines = computed(() => {
   })
 })
 
+function ipv4Octets(address: string): number[] | null {
+  const parts = address.split('.')
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return null
+  const octets = parts.map(Number)
+  return octets.every((octet) => octet <= 255) ? octets : null
+}
+
+function isPublicIpv4(address: string): boolean {
+  const octets = ipv4Octets(address)
+  if (!octets) return false
+  const [a, b] = octets
+  return a !== 0 && a !== 10 && a !== 127 && a < 224 &&
+    !(a === 100 && b >= 64 && b <= 127) &&
+    !(a === 169 && b === 254) &&
+    !(a === 172 && b >= 16 && b <= 31) &&
+    !(a === 192 && b === 168)
+}
+
+function machineIp(machine: NodeDto): string {
+  const configured = [machine.public_address, machine.management_address]
+    .map((address) => address?.trim())
+    .find((address) => address && (ipv4Octets(address) || address.includes(':')))
+  if (configured) return configured
+
+  const addresses = (machine.interfaces ?? [])
+    .filter((iface) => !iface.is_loopback)
+    .flatMap((iface) => iface.addresses.map((address) => ({ address, name: iface.name })))
+  return addresses.find(({ address }) => isPublicIpv4(address))?.address
+    ?? addresses.find(({ address, name }) => ipv4Octets(address) && /^(eth|en|bond)/.test(name))?.address
+    ?? addresses.find(({ address }) => ipv4Octets(address))?.address
+    ?? addresses.find(({ address }) => address.includes(':') && !address.startsWith('fe80:'))?.address
+    ?? '—'
+}
+
 async function showInstall() {
   if (!detail.value) return
   try {
-    install.value = await api.get<InstallCommandDto>(
+    install.value = await api.post<InstallCommandDto>(
       `/groups/${groupId.value}/install-command`,
+      {},
     )
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -198,13 +233,13 @@ function kindClass(kind: string): string {
         </div>
       </div>
       <div class="card">
-        <div class="card-label">下行</div>
+        <div class="card-label">接收</div>
         <div class="card-value">
           {{ bitrate(machines.reduce((s, m) => s + (m.rx_bps ?? 0), 0)) }}
         </div>
       </div>
       <div class="card">
-        <div class="card-label">上行</div>
+        <div class="card-label">发送</div>
         <div class="card-value">
           {{ bitrate(machines.reduce((s, m) => s + (m.tx_bps ?? 0), 0)) }}
         </div>
@@ -229,16 +264,16 @@ function kindClass(kind: string): string {
       <table>
         <thead>
           <tr>
-            <th>名称</th><th>主机名</th><th>角色</th><th>状态</th>
+            <th>名称</th><th>IP</th><th>角色</th><th>状态</th>
             <th class="num">CPU</th><th class="num">内存</th>
-            <th class="num">连接</th><th class="num">下行</th><th class="num">上行</th>
+            <th class="num">连接</th><th class="num">接收</th><th class="num">发送</th>
             <th>版本</th><th class="num">运行时长</th><th>最后心跳</th><th></th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="m in machines" :key="m.id">
             <td>{{ m.name }}</td>
-            <td class="mono dim">{{ m.hostname ?? '—' }}</td>
+            <td class="mono dim">{{ machineIp(m) }}</td>
             <td><span class="pill pill-info">{{ m.role }}</span></td>
             <td><span :class="statusClass(m.status)">{{ m.status === 'online' ? '在线' : '离线' }}</span></td>
             <td class="num">{{ percent(m.cpu_percent) }}</td>

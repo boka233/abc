@@ -14,6 +14,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::request::Parts;
 use axum::Json;
+use chrono::{Duration as ChronoDuration, NaiveDate};
 use serde::{Deserialize, Serialize};
 use tunnel_storage::audit::AuditRepo;
 use tunnel_storage::models::{
@@ -986,6 +987,51 @@ pub async fn traffic(
     })))
 }
 
+#[derive(Deserialize)]
+pub struct DailyTrafficQuery {
+    pub date: String,
+    /// Minutes east of UTC, supplied by the browser (e.g. 480 for UTC+8).
+    pub utc_offset_minutes: i32,
+}
+
+fn daily_utc_bounds(date: &str, offset_minutes: i32) -> ApiResult<(String, String)> {
+    if !(-840..=840).contains(&offset_minutes) {
+        return Err(ApiError::bad_request("时区偏移超出范围"));
+    }
+    let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| ApiError::bad_request("日期必须是 YYYY-MM-DD"))?;
+    let local_midnight = day
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| ApiError::bad_request("无效日期"))?
+        .and_utc();
+    let start = local_midnight
+        .checked_sub_signed(ChronoDuration::minutes(offset_minutes.into()))
+        .ok_or_else(|| ApiError::bad_request("日期超出范围"))?;
+    let end = start
+        .checked_add_signed(ChronoDuration::days(1))
+        .ok_or_else(|| ApiError::bad_request("日期超出范围"))?;
+    Ok((start.to_rfc3339(), end.to_rfc3339()))
+}
+
+pub async fn daily_traffic(
+    State(state): State<Arc<AppState>>,
+    _user: AuthUser,
+    Query(q): Query<DailyTrafficQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (start, end) = daily_utc_bounds(&q.date, q.utc_offset_minutes)?;
+    let routes = StatsRepo::new(&state.db).daily_routes(&start, &end).await?;
+    let rx_bytes: i64 = routes.iter().map(|route| route.rx_bytes).sum();
+    let tx_bytes: i64 = routes.iter().map(|route| route.tx_bytes).sum();
+    Ok(Json(serde_json::json!({
+        "date": q.date,
+        "utc_offset_minutes": q.utc_offset_minutes,
+        "rx_bytes": rx_bytes,
+        "tx_bytes": tx_bytes,
+        "total_bytes": rx_bytes + tx_bytes,
+        "routes": routes,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // audit log
 // ---------------------------------------------------------------------------
@@ -1351,6 +1397,15 @@ fn _parts_marker(_: &Parts) {}
 mod tests {
     use super::*;
     use tunnel_common::model::TargetHealth;
+
+    #[test]
+    fn daily_bounds_follow_the_browser_calendar_day() {
+        let (start, end) = daily_utc_bounds("2026-09-26", 480).unwrap();
+        assert_eq!(start, "2026-09-25T16:00:00+00:00");
+        assert_eq!(end, "2026-09-26T16:00:00+00:00");
+        assert!(daily_utc_bounds("2026-02-30", 480).is_err());
+        assert!(daily_utc_bounds("2026-09-26", 900).is_err());
+    }
 
     fn health(addr: &str, tripped: bool, ok: u64, failed: u64, active: u64) -> TargetHealth {
         TargetHealth {

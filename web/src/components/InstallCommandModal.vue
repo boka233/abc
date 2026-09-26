@@ -2,9 +2,7 @@
 /**
  * 一键对接命令弹窗。
  *
- * 命令里带着组令牌，所以必须说明两件事：这是**唯一**能看到该令牌的时机（库里只有
- * 哈希），以及查看动作本身会让旧令牌失效。后者是个真实的取舍 —— 要么明文存令牌，
- * 要么每次查看都重新签发，我们选了后者。
+ * 每条新命令带一个新令牌。明文只在签发时返回，原有机器的令牌继续有效。
  */
 import { ref } from 'vue'
 import type { InstallCommandDto } from '@/api'
@@ -36,9 +34,8 @@ async function copy() {
 
       <div class="banner banner-warn">
         <strong>命令中包含注册令牌，请立即复制。</strong>
-        库中只存哈希，无法再次查看。每次打开本弹窗都会重新签发令牌，<strong
-          >旧令牌随即失效</strong
-        >；组内已在线的机器不会掉线，但重装或新增机器需使用最新命令。
+        库中只存哈希，无法再次查看。每次打开本弹窗都会签发新令牌；
+        已对接机器的令牌继续有效，不会因添加机器而断线。
       </div>
 
       <div v-if="data.warning" class="banner banner-bad">{{ data.warning }}</div>

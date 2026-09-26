@@ -474,6 +474,14 @@ mod tests {
             "connect ignored its timeout budget"
         );
         if let Err(e) = outcome {
+            // Restricted Windows environments can deny outbound sockets before
+            // a connection attempt reaches the network. That is unrelated to
+            // the timeout and retry classification this test exercises.
+            if cfg!(windows)
+                && matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                return;
+            }
             assert!(e.is_transient(), "connect failure should be retryable: {e:?}");
         }
     }

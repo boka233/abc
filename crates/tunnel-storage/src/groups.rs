@@ -18,6 +18,7 @@ use crate::models::{
     CreateDeviceGroup, DeviceGroupDto, DeviceGroupRow, GroupKind, UpdateDeviceGroup,
 };
 use crate::users::{hash_password, verify_password};
+use sha2::{Digest, Sha256};
 
 pub struct DeviceGroupRepo<'a> {
     db: &'a Database,
@@ -42,6 +43,10 @@ fn validate_kind(kind: &str) -> Result<()> {
 
 fn normalise(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn token_digest(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 impl<'a> DeviceGroupRepo<'a> {
@@ -209,24 +214,44 @@ impl<'a> DeviceGroupRepo<'a> {
         Ok(())
     }
 
-    /// 轮换注册令牌，旧令牌立即失效。
-    ///
-    /// 已在线的 agent 不会掉线（它们已注册），但下次重新注册会失败，所以轮换后
-    /// 要更新组内所有机器的配置。
+    /// 为新的安装命令签发额外令牌，保留已部署机器正在使用的令牌。
+    pub async fn issue_token(&self, id: &str) -> Result<String> {
+        self.get_row(id).await?;
+        let token = crate::users::generate_password(40);
+        sqlx::query(
+            "INSERT INTO device_group_tokens (id, group_id, token_digest, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(new_id())
+        .bind(id)
+        .bind(token_digest(&token))
+        .bind(now_string())
+        .execute(self.db.pool())
+        .await?;
+        Ok(token)
+    }
+
+    /// 显式轮换整个组的凭据；所有旧令牌（包括已部署机器使用的）立即失效。
     pub async fn rotate_token(&self, id: &str) -> Result<String> {
         let token = crate::users::generate_password(40);
         let hash = hash_password(&token)?;
+        let mut tx = self.db.pool().begin().await?;
         let result = sqlx::query(
             "UPDATE device_groups SET enroll_token_hash = ?, updated_at = ? WHERE id = ?",
         )
         .bind(hash)
         .bind(now_string())
         .bind(id)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("设备组 {id}")));
         }
+        sqlx::query("DELETE FROM device_group_tokens WHERE group_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(token)
     }
 
@@ -244,18 +269,35 @@ impl<'a> DeviceGroupRepo<'a> {
         if row.enabled == 0 {
             return Ok(None);
         }
-        if !verify_password(token, &row.enroll_token_hash) {
-            return Ok(None);
+        if verify_password(token, &row.enroll_token_hash) {
+            return Ok(Some(row));
         }
-        Ok(Some(row))
+        let extra: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM device_group_tokens WHERE group_id = ? AND token_digest = ?",
+        )
+        .bind(group_id)
+        .bind(token_digest(token))
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(extra.map(|_| row))
     }
 
     /// 仅凭令牌查找组，供 agent 自注册使用。
     ///
     /// 一键对接的命令里只有令牌，没有组 id —— 让用户从面板复制两个值是多余的
-    /// 摩擦。代价是这里必须遍历组逐个比对哈希：Argon2 校验很慢，所以组数量多时
-    /// 会有可感知的延迟。这条路径只在 agent 首次注册时走一次，不在热路径上。
+    /// 摩擦。新令牌先用摘要索引查找；旧版组令牌仍按 Argon2 哈希逐组校验。
     pub async fn find_by_token(&self, token: &str) -> Result<Option<DeviceGroupRow>> {
+        let extra: Option<(String,)> = sqlx::query_as(
+            "SELECT t.group_id FROM device_group_tokens t
+             JOIN device_groups g ON g.id = t.group_id
+             WHERE g.enabled = 1 AND t.token_digest = ?",
+        )
+        .bind(token_digest(token))
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some((group_id,)) = extra {
+            return Ok(Some(self.get_row(&group_id).await?));
+        }
         let rows: Vec<DeviceGroupRow> =
             sqlx::query_as("SELECT * FROM device_groups WHERE enabled = 1")
                 .fetch_all(self.db.pool())
@@ -421,9 +463,26 @@ mod tests {
         let repo = DeviceGroupRepo::new(&db);
         let (group, old) = repo.create(new_group("g", "inbound")).await.unwrap();
 
+        let additional = repo.issue_token(&group.id).await.unwrap();
+        assert_ne!(old, additional);
+        assert!(repo.verify_token(&group.id, &old).await.unwrap().is_some());
+        assert!(repo.verify_token(&group.id, &additional).await.unwrap().is_some());
+        assert_eq!(repo.find_by_token(&additional).await.unwrap().unwrap().id, group.id);
+        let stored: (String,) = sqlx::query_as(
+            "SELECT token_digest FROM device_group_tokens WHERE group_id = ?",
+        )
+        .bind(&group.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored.0, token_digest(&additional));
+        assert_ne!(stored.0, additional);
+
         let new = repo.rotate_token(&group.id).await.unwrap();
         assert_ne!(old, new);
         assert!(repo.verify_token(&group.id, &old).await.unwrap().is_none());
+        assert!(repo.verify_token(&group.id, &additional).await.unwrap().is_none());
+        assert!(repo.find_by_token(&additional).await.unwrap().is_none());
         assert!(repo.verify_token(&group.id, &new).await.unwrap().is_some());
     }
 

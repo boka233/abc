@@ -526,9 +526,11 @@ mod tests {
 
     #[test]
     fn missing_certificate_file_is_reported_clearly() {
+        let pki = TestPki::new("missing-cert");
         let cfg = TlsConfig {
             cert_path: Some("/nonexistent/cert.pem".into()),
             key_path: Some("/nonexistent/key.pem".into()),
+            ca_path: Some(pki.ca_path.display().to_string()),
             ..Default::default()
         };
         let err = TlsMaterial::load(&cfg, true).unwrap_err();
@@ -537,6 +539,7 @@ mod tests {
 
     #[test]
     fn malformed_pem_is_rejected_without_leaking_contents() {
+        let pki = TestPki::new("malformed-pem");
         let dir = std::env::temp_dir().join(format!("tunnel-tls-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join("bad.pem");
@@ -545,6 +548,7 @@ mod tests {
         let cfg = TlsConfig {
             cert_path: Some(bad.display().to_string()),
             key_path: Some(bad.display().to_string()),
+            ca_path: Some(pki.ca_path.display().to_string()),
             ..Default::default()
         };
         let err = TlsMaterial::load(&cfg, true).unwrap_err();

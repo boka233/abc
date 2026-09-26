@@ -671,8 +671,6 @@ mod tests {
             node_name: "n1".into(),
             control_url: "http://127.0.0.1:8080".into(),
             cache_path: dir.join("lkg.json"),
-            // insecure_skip_verify keeps the test from needing a PKI; the pool
-            // still exercises the real rustls client path.
             tls: TlsConfig {
                 insecure_skip_verify: true,
                 ..Default::default()
@@ -737,7 +735,12 @@ mod tests {
                 handshake_timeout: Duration::from_millis(200),
                 ..Default::default()
             },
-            tls: TlsConfig::default(),
+            // The supervisor uses the distributed TLS settings when local
+            // certificate paths are absent. These tests have no test CA.
+            tls: TlsConfig {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
             tunnel_psk: Some(Secret::new("psk")),
             issued_at: None,
         }

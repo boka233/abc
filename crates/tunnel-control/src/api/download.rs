@@ -63,6 +63,7 @@ impl Arch {
 /// 很多部署是 `http://panel:8080`（面板在内网、前面没有 TLS 终结），此时下载一个
 /// 将以 root 权限运行的可执行文件而不校验，等于接受中间人替换。
 pub const SHA256_HEADER: &str = "x-binary-sha256";
+pub const VERSION_HEADER: &str = "x-binary-version";
 
 /// `GET /api/agent/download/tunnel-agent-{arch}`
 pub async fn download_agent(
@@ -119,6 +120,10 @@ pub async fn download_agent(
             (
                 header::HeaderName::from_static(SHA256_HEADER),
                 digest,
+            ),
+            (
+                header::HeaderName::from_static(VERSION_HEADER),
+                env!("CARGO_PKG_VERSION").to_string(),
             ),
             // 二进制按版本发布，不该被代理长期缓存 —— 升级后拿到旧文件会很难排查。
             (header::CACHE_CONTROL, "no-store".to_string()),

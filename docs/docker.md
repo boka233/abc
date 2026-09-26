@@ -176,17 +176,36 @@ docker cp tunnel-agent-aarch64 \
 
 ## 备份与恢复
 
-```bash
-# 备份。用 sqlite3 的 .backup 而不是直接 cp：WAL 模式下直接拷会得到不一致的快照。
-docker exec tunnel-control sqlite3 /var/lib/tunnel-control/control.db \
-  ".backup '/var/lib/tunnel-control/backup.db'"
-docker cp tunnel-control:/var/lib/tunnel-control/backup.db ./backup-$(date +%F).db
+备份与恢复都在控制面**停止**时进行，并且把整个数据目录当作一个整体拷贝：
 
-# 恢复
+```bash
+cd /opt/tunnel
+
+# 备份
 docker compose stop control
-docker cp ./backup-2026-01-01.db tunnel-control:/var/lib/tunnel-control/control.db
+docker cp tunnel-control:/var/lib/tunnel-control/. ./backup-$(date +%F)/
+docker compose start control
+
+# 恢复（以 2026-01-01 的备份为例）
+docker compose stop control
+docker cp ./backup-2026-01-01/. tunnel-control:/var/lib/tunnel-control/
+docker compose run --rm --no-deps --user 0 --entrypoint chown control \
+  -R tunnel:tunnel /var/lib/tunnel-control
 docker compose start control
 ```
+
+几条容易踩的坑，也是上面这样写的原因：
+
+- **不能用 `sqlite3 .backup`**：运行镜像里没有装 `sqlite3`，那条命令会直接报
+  `executable file not found`，什么都没备份。
+- **必须先停控制面**：数据库开着 WAL，运行中直接拷贝，拿到的 `control.db` 与
+  `control.db-wal` 可能不是同一时刻的状态。停下来之后，整个目录就是一致的。
+- **`control.db` 与 `-wal`、`-shm` 要一起拷**：只把 `control.db` 拷回去、留着容器里
+  旧的 `-wal`，SQLite 下次打开时会把旧日志套到新数据库上，可能把库弄坏。拷整个
+  目录就不会有这个问题。
+- **拷回去后要修正属主**：`docker cp` 写进容器的文件属于 root，而控制面以
+  `tunnel` 用户运行，不修正就无法写数据库，启动会失败。控制面停着时没法
+  `docker exec`，所以用 `docker compose run --rm` 临时起一个容器来 `chown`。
 
 配置文件 `configs/control.docker.toml` **也要一起备份** —— 里面有 `jwt_secret` 与
 `tunnel_psk`。丢了它们：所有会话失效（可接受，重新登录即可），所有 agent 握手失败

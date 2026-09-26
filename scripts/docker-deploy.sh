@@ -626,11 +626,16 @@ else
         fi
     fi
 
-    # --- 3. Docker build 阶段 ---
-    if [[ "$PLACED" == "no" ]]; then
-        info "改从 Docker 构建阶段提取（较慢）…"
-        # 不丢 stderr：构建失败的真正原因（比如依赖 MSRV 超出基础镜像）
-        # 必须让用户看到，否则只会得到一句「跳过」。
+    # --- 3. Docker build 阶段：只在显式 --build 时才做 ---
+    #
+    # 这一步要在本机编译整个 Rust workspace：十几分钟、约 2 GB 内存、约 4 GB 磁盘。
+    # 以前拿不到 Release 的 agent 就自动走这里 —— 在小磁盘机器上它必然写满磁盘
+    # （no space left on device），而且报错出现在 Docker 构建输出里，离真正的原因
+    # （下载的 agent 不能用）很远。控制面镜像的回落早就改成了「问一句或停下」，
+    # agent 这里保持一致。
+    if [[ "$PLACED" == "no" && "$FORCE_BUILD" == "yes" ]]; then
+        info "已指定 --build，从 Docker 构建阶段提取 agent（较慢）…"
+        # 不丢 stderr：构建失败的真正原因必须让用户看到。
         if docker build --target build -t tunnel-build:local "$REPO_ROOT"; then
             cid="$(docker create tunnel-build:local)"
             if docker cp "$cid:/src/target/release/tunnel-agent" "$TMP_AGENT"; then
@@ -644,14 +649,27 @@ else
         fi
     fi
 
+    if [[ "$PLACED" == "no" && "$FORCE_BUILD" != "yes" ]]; then
+        warn "没有可用的 tunnel-agent-$ASSET_ARCH（$VERSION）。未在本机编译 ——"
+        warn "那要十几分钟、约 2 GB 内存和 4 GB 磁盘，小机器上会写满磁盘。"
+        warn "面板本身已经正常运行，只是新机器的一键对接暂时拿不到 agent 二进制。"
+        warn "  * 若上方提示「无法运行」：Release 里的二进制与本机系统不兼容，等发布修复版本后重跑本脚本"
+        warn "  * 确认磁盘和内存都够，要在本机编译：$0 --build"
+    fi
+
     rm -f "$TMP_AGENT"
     [[ "$PLACED" == "yes" ]] && ok "已放置 $AGENT_DEST"
 fi
 
 if [[ "$ASSET_ARCH" != "" ]]; then
     INSTALLED_VERSION="$(docker exec -u tunnel tunnel-control "$AGENT_DEST" --version 2>/dev/null || true)"
-    [[ "$INSTALLED_VERSION" == "tunnel-agent $VERSION" ]] \
-        || die "控制面仍在提供 ${INSTALLED_VERSION:-无法运行的} agent；当前仓库版本是 $VERSION。请检查上方下载或构建错误后重跑部署脚本。"
+    # 不在这里 die：走到这一步时控制面已经升级完、正在运行。以前这里会让整个脚本以
+    # 失败退出，于是后面的首次登录信息与收尾说明都打印不出来，看起来像是升级失败了，
+    # 其实只有「给新机器下载 agent」这一件事受影响。
+    if [[ "$INSTALLED_VERSION" != "tunnel-agent $VERSION" ]]; then
+        warn "一键对接下发的 agent 是 ${INSTALLED_VERSION:-无法运行的版本}，不是 $VERSION。"
+        warn "已接入的机器不受影响；新机器对接要等这里换成 $VERSION。"
+    fi
 fi
 
 if ! docker exec -u tunnel tunnel-control test -s "$AGENT_DEST" >/dev/null 2>&1 \
@@ -737,11 +755,11 @@ ${C_BOLD}常用命令${C_RESET}
   ./scripts/docker-deploy.sh --rebuild    改了代码后重新构建
   docker compose ps                       查看状态
 
-${C_BOLD}备份${C_RESET}
+${C_BOLD}备份${C_RESET}（先停控制面，把整个数据目录拷出来；恢复步骤见 docs/docker.md）
 
-  docker exec tunnel-control sqlite3 /var/lib/tunnel-control/control.db \\
-    ".backup '/var/lib/tunnel-control/backup.db'"
-  docker cp tunnel-control:/var/lib/tunnel-control/backup.db ./
+  docker compose stop control
+  docker cp tunnel-control:/var/lib/tunnel-control/. ./backup-\$(date +%F)/
+  docker compose start control
 
 ${C_BOLD}文档${C_RESET}
   docs/docker.md          Docker 部署细节

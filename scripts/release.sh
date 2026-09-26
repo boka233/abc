@@ -100,6 +100,32 @@ triple_for() {
     esac
 }
 
+# 发布的二进制最多允许要求的 glibc 版本。
+#
+# 动态链接的二进制会记录它用到的最高 glibc 符号版本，目标机的 glibc 比这个旧就根本
+# 加载不起来（连 --version 都跑不了）。这个值取决于**构建机**的 glibc，不取决于代码：
+# 在 Ubuntu 24.04（glibc 2.39）上构建，产物就要求 2.39，而 Debian 12 只有 2.36。
+# v0.1.5 就是这样坏掉的 —— GitHub 的 ubuntu-latest 升到 24.04 之后，没有任何代码改动，
+# 发布出来的 agent 却在 Debian 12 上跑不起来了。
+#
+# 2.36 = Debian 12，是 docs 里声明支持的最旧系统。改它之前先确认目标机器都满足。
+readonly GLIBC_FLOOR="2.36"
+
+# 超过 GLIBC_FLOOR 就中止，而不是发布一个在部分受支持系统上跑不起来的二进制。
+check_glibc_floor() {
+    local bin="$1" need
+    # 从二进制里取出引用到的最高 GLIBC_x.y 版本号。静态链接（musl）的没有这些字串，
+    # need 为空即放行。
+    need="$(grep -a -o 'GLIBC_[0-9][0-9.]*' "$bin" | sed 's/^GLIBC_//' | sort -u -V | tail -n 1)"
+    [[ -z "$need" ]] && return 0
+    if [[ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$need" | sort -V | tail -n 1)" != "$GLIBC_FLOOR" ]]; then
+        die "$(basename "$bin") 要求 glibc $need，超出下限 $GLIBC_FLOOR（Debian 12）。
+这个版本由构建机的 glibc 决定，与代码无关 —— 请在 glibc 不高于 $GLIBC_FLOOR 的系统上构建
+（CI 里用 rust:1-bookworm 容器，见 .github/workflows/release.yml）。"
+    fi
+    info "$(basename "$bin") 最高要求 glibc $need（下限 $GLIBC_FLOOR）"
+}
+
 # ---------------------------------------------------------------------------
 # 版本号
 # ---------------------------------------------------------------------------
@@ -191,6 +217,7 @@ build_for_arch() {
     local bin_dir="$REPO_ROOT/target/$triple/release"
     for bin in tunnel-control tunnel-agent; do
         [[ -x "$bin_dir/$bin" ]] || die "构建完成但找不到 $bin_dir/$bin"
+        check_glibc_floor "$bin_dir/$bin"
     done
     ok "$arch 二进制就绪"
 

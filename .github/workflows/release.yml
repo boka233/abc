@@ -14,6 +14,16 @@ jobs:
   release:
     name: 构建发布包
     runs-on: ubuntu-latest
+    # 在 Debian 12 容器里构建，而不是直接用 runner 的系统。
+    #
+    # 动态链接的二进制要求的 glibc 版本由**构建机**决定。ubuntu-latest 升到 24.04
+    # （glibc 2.39）之后，发布出来的 agent 在 Debian 12（glibc 2.36）上连 --version
+    # 都跑不起来 —— v0.1.5、v0.1.6 就是这样坏的，代码本身没有任何改动。
+    #
+    # rust:1-bookworm 就是 Dockerfile 构建镜像用的那一个，已经证明能编过整个 workspace。
+    # Rust 版本跟随最新稳定版：依赖的 MSRV 会随 cargo update 往上走（见 Dockerfile）。
+    container:
+      image: rust:1-bookworm
 
     steps:
       - uses: actions/checkout@v4
@@ -21,10 +31,13 @@ jobs:
           # release.sh 要读 git sha 写进 BUILD-INFO。
           fetch-depth: 0
 
-      - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+      # 仓库目录在容器里属于另一个 uid，git 会拒绝操作并报 dubious ownership，
+      # release.sh 读 git sha 与 dirty 状态时就会拿到错误结果。
+      - name: 标记仓库目录为可信
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: 添加 aarch64 编译目标
+        run: rustup target add aarch64-unknown-linux-gnu
 
       - uses: actions/setup-node@v4
         with:
@@ -32,12 +45,12 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      # ring 与 libsqlite3-sys 含 C 代码，交叉编译到 aarch64 需要目标平台的
-      # C 工具链。装系统交叉编译器比用 cross 快 —— 后者要拉容器镜像。
+      # ring 与 libsqlite3-sys 含 C 代码，交叉编译到 aarch64 需要目标平台的 C 工具链。
+      # 容器里以 root 运行，不需要 sudo。
       - name: 安装 aarch64 交叉工具链
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          apt-get update -qq
+          apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
       # release.sh 自己会跑 cargo test --workspace；测试不过就不出包。
       - name: 构建两个架构的发布包

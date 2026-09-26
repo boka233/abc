@@ -165,6 +165,10 @@ sqlite3 /var/lib/tunnel-control/control.db ".backup '/backup/control-升级前.d
   `traffic_stats` 样本回溯历史；保留期之外（已被清理）的无法找回。
 - **0010** `ip_geo_cache` —— 公网 IP 的地区查询缓存。
 
+v0.1.7 没有新迁移。它修复 v0.1.5、v0.1.6 的 Release 二进制在 Debian 12 上无法运行的
+问题：那两个版本在 Ubuntu 24.04 上构建，要求 glibc 2.39，而 Debian 12 只有 2.36。
+现在发布构建在 Debian 12 容器里进行，并会拒绝发布要求 glibc 高于 2.36 的二进制。
+
 ## 发布前自查
 
 ```bash

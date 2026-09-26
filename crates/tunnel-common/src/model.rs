@@ -892,6 +892,12 @@ pub struct HostStats {
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
     pub uptime_secs: u64,
+    #[serde(default)]
+    pub host_uptime_secs: u64,
+    #[serde(default)]
+    pub disk_used_bytes: u64,
+    #[serde(default)]
+    pub disk_total_bytes: u64,
     pub open_fds: Option<u64>,
     pub load_avg_1m: Option<f32>,
 }

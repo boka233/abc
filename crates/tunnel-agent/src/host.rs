@@ -22,14 +22,50 @@ static PREV_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PREV_IDLE: AtomicU64 = AtomicU64::new(0);
 
 pub fn sample() -> HostStats {
+    let memory = memory();
+    let disk = disk_usage();
     HostStats {
         cpu_percent: cpu_percent(),
-        memory_used_bytes: memory().map(|m| m.used).unwrap_or(0),
-        memory_total_bytes: memory().map(|m| m.total).unwrap_or(0),
+        memory_used_bytes: memory.as_ref().map(|m| m.used).unwrap_or(0),
+        memory_total_bytes: memory.as_ref().map(|m| m.total).unwrap_or(0),
         uptime_secs: 0, // filled in by the supervisor with process uptime
+        host_uptime_secs: host_uptime(),
+        disk_used_bytes: disk.map(|d| d.0).unwrap_or(0),
+        disk_total_bytes: disk.map(|d| d.1).unwrap_or(0),
         open_fds: open_fds(),
         load_avg_1m: load_average(),
     }
+}
+
+fn host_uptime() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|seconds| seconds as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn disk_usage() -> Option<(u64, u64)> {
+    // Host sampling is infrequent, so using the standard system utility keeps
+    // this crate free of platform-specific FFI and extra dependencies.
+    let output = std::process::Command::new("df")
+        .args(["-P", "-B1", "/"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+    let total: u64 = fields.get(1)?.parse().ok()?;
+    let used: u64 = fields.get(2)?.parse().ok()?;
+    Some((used, total))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disk_usage() -> Option<(u64, u64)> {
+    None
 }
 
 struct Memory {

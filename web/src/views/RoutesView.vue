@@ -820,8 +820,7 @@ const currentStrategyHint = computed(
           <label>出站源 IP</label>
           <input v-model="form.egress_source_ip" placeholder="203.0.113.9" />
           <div class="hint">
-            拨目标时绑定的本机地址。<strong>IEPL 双网卡必填</strong> —— 不绑公网源
-            地址时，内核可能把去落地机的流量也从专线网卡送出去，绕回对端再出国。
+              仅多网卡主机需要指定出站地址时填写。普通直连转发留空，按系统路由连接目标。
           </div>
         </div>
       </div>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   api,
@@ -51,7 +51,12 @@ async function load() {
   }
 }
 
-onMounted(load)
+let refreshTimer: number | undefined
+onMounted(() => {
+  void load()
+  refreshTimer = window.setInterval(() => { void load() }, 10_000)
+})
+onUnmounted(() => window.clearInterval(refreshTimer))
 watch(() => telemetry.configGeneration, load)
 watch(groupId, load)
 
@@ -73,9 +78,12 @@ const machines = computed(() => {
       memory_used_bytes: live.host.memory_used_bytes,
       memory_total_bytes: live.host.memory_total_bytes,
       uptime_secs: live.host.uptime_secs,
+      host_uptime_secs: live.host.host_uptime_secs,
+      disk_used_bytes: live.host.disk_used_bytes,
+      disk_total_bytes: live.host.disk_total_bytes,
       agent_version: live.agent_version,
       tunnels: live.tunnels,
-      interfaces: m.interfaces,
+      interfaces: live.interfaces ?? m.interfaces,
     }
   })
 })
@@ -98,21 +106,75 @@ function isPublicIpv4(address: string): boolean {
     !(a === 192 && b === 168)
 }
 
-function machineIp(machine: NodeDto): string {
-  const configured = [machine.public_address, machine.management_address]
-    .map((address) => address?.trim())
-    .find((address) => address && (ipv4Octets(address) || address.includes(':')))
-  if (configured) return configured
-
-  const addresses = (machine.interfaces ?? [])
-    .filter((iface) => !iface.is_loopback)
-    .flatMap((iface) => iface.addresses.map((address) => ({ address, name: iface.name })))
-  return addresses.find(({ address }) => isPublicIpv4(address))?.address
-    ?? addresses.find(({ address, name }) => ipv4Octets(address) && /^(eth|en|bond)/.test(name))?.address
-    ?? addresses.find(({ address }) => ipv4Octets(address))?.address
-    ?? addresses.find(({ address }) => address.includes(':') && !address.startsWith('fe80:'))?.address
-    ?? '—'
+function isPublicIpv6(address: string): boolean {
+  const normalized = address.toLowerCase().split('%')[0]
+  return normalized.includes(':') && normalized !== '::1' && normalized !== '::' &&
+    !normalized.startsWith('fe80:') && !normalized.startsWith('fc') &&
+    !normalized.startsWith('fd') && !normalized.startsWith('ff')
 }
+
+function publicIps(machine: NodeDto): { v4?: string; v6?: string } {
+  const addresses = [machine.observed_ip, machine.public_address, machine.management_address]
+    .filter((address): address is string => Boolean(address))
+    .concat((machine.interfaces ?? [])
+    .filter((iface) => !iface.is_loopback)
+    .flatMap((iface) => iface.addresses))
+  return {
+    v4: addresses.find(isPublicIpv4),
+    v6: addresses.find(isPublicIpv6),
+  }
+}
+
+function machineIp(machine: NodeDto): string {
+  const ips = publicIps(machine)
+  return ips.v4 ?? ips.v6 ?? machine.observed_ip ?? '—'
+}
+
+const geoRegions = ref<Record<string, string>>({})
+const geoRequested = new Set<string>()
+
+// Only look up each public IP once per page visit. A failed lookup leaves the
+// country unknown, without blocking telemetry or route management.
+watch(machines, (members) => {
+  for (const machine of members) {
+    for (const ip of Object.values(publicIps(machine))) {
+      if (!ip || geoRequested.has(ip)) continue
+      geoRequested.add(ip)
+      const controller = new AbortController()
+      const timeout = window.setTimeout(() => controller.abort(), 5000)
+      fetch(`https://api.country.is/${encodeURIComponent(ip)}`, { signal: controller.signal })
+        .then((response) => response.ok ? response.json() : null)
+        .then((data: { country?: string } | null) => {
+          const code = data?.country?.toUpperCase()
+          const localized = code && /^[A-Z]{2}$/.test(code)
+            ? new Intl.DisplayNames(['zh-CN'], { type: 'region' }).of(code)
+            : undefined
+          geoRegions.value = {
+            ...geoRegions.value,
+            [ip]: localized ?? '—',
+          }
+        })
+        .catch(() => {
+          geoRegions.value = { ...geoRegions.value, [ip]: '—' }
+        })
+        .finally(() => window.clearTimeout(timeout))
+    }
+  }
+}, { immediate: true })
+
+function regionFor(machine: NodeDto, family: 'v4' | 'v6'): string {
+  const ip = publicIps(machine)[family]
+  return ip ? (geoRegions.value[ip] ?? '识别中') : '—'
+}
+
+function usage(used: number, total: number): number {
+  return total > 0 ? Math.min(100, Math.max(0, used / total * 100)) : 0
+}
+
+const showTunnelDetails = computed(() => Boolean(detail.value && (
+  detail.value.group.kind === 'outbound' ||
+  detail.value.routes.some((route) => route.mode !== 'direct')
+)))
 
 async function showInstall() {
   if (!detail.value) return
@@ -233,21 +295,17 @@ function kindClass(kind: string): string {
         </div>
       </div>
       <div class="card">
-        <div class="card-label">接收</div>
-        <div class="card-value">
-          {{ bitrate(machines.reduce((s, m) => s + (m.rx_bps ?? 0), 0)) }}
+        <div class="card-label">当前速率</div>
+        <div class="compact-lines mono">
+          <div>↑ {{ bitrate(machines.reduce((s, m) => s + (m.rx_bps ?? 0), 0)) }}</div>
+          <div>↓ {{ bitrate(machines.reduce((s, m) => s + (m.tx_bps ?? 0), 0)) }}</div>
         </div>
       </div>
       <div class="card">
-        <div class="card-label">发送</div>
-        <div class="card-value">
-          {{ bitrate(machines.reduce((s, m) => s + (m.tx_bps ?? 0), 0)) }}
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-label">地区</div>
-        <div class="card-value" style="font-size: 16px">
-          {{ detail.group.region || '未设置' }}
+        <div class="card-label">累计流量</div>
+        <div class="compact-lines mono">
+          <div>↑ {{ bytes(machines.reduce((s, m) => s + (m.total_rx_bytes ?? 0), 0)) }}</div>
+          <div>↓ {{ bytes(machines.reduce((s, m) => s + (m.total_tx_bytes ?? 0), 0)) }}</div>
         </div>
       </div>
       <div class="card">
@@ -260,37 +318,40 @@ function kindClass(kind: string): string {
     </div>
 
     <h2>组内机器</h2>
+    <p class="dim small">v4/v6 地区按节点公网 IP 自动识别。多网卡主机的实际目标出口以系统路由和线路源 IP 为准。</p>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
-            <th>名称</th><th>IP</th><th>角色</th><th>状态</th>
-            <th class="num">CPU</th><th class="num">内存</th>
-            <th class="num">连接</th><th class="num">接收</th><th class="num">发送</th>
-            <th>版本</th><th class="num">运行时长</th><th>最后心跳</th><th></th>
+            <th>机器</th><th>状态</th>
+            <th title="根据节点公网 IPv4 自动识别国家或地区">v4 地区</th>
+            <th title="根据节点公网 IPv6 自动识别国家或地区；没有 IPv6 时显示空缺">v6 地区</th>
+            <th title="面板看到的节点地址；多网卡机器的实际目标出口可能不同">节点 IP</th>
+            <th>速率</th><th>开机时长</th><th>累计流量</th>
+            <th>CPU</th><th>RAM</th><th>存储</th><th>操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="m in machines" :key="m.id">
-            <td>{{ m.name }}</td>
-            <td class="mono dim">{{ machineIp(m) }}</td>
-            <td><span class="pill pill-info">{{ m.role }}</span></td>
+            <td>{{ m.name }}<div class="dim small">{{ m.role }} · {{ m.connections }} 连接 · v{{ m.agent_version ?? '—' }}</div></td>
             <td><span :class="statusClass(m.status)">{{ m.status === 'online' ? '在线' : '离线' }}</span></td>
-            <td class="num">{{ percent(m.cpu_percent) }}</td>
-            <td class="num">{{ bytes(m.memory_used_bytes) }}</td>
-            <td class="num">{{ m.connections }}</td>
-            <td class="num">{{ bitrate(m.rx_bps) }}</td>
-            <td class="num">{{ bitrate(m.tx_bps) }}</td>
-            <td class="dim">{{ m.agent_version ?? '—' }}</td>
-            <td class="num">{{ duration(m.uptime_secs) }}</td>
-            <td class="dim">{{ ago(m.last_heartbeat_at) }}</td>
+            <td>{{ regionFor(m, 'v4') }}</td>
+            <td>{{ regionFor(m, 'v6') }}</td>
+            <td class="mono">{{ machineIp(m) }}</td>
+            <td class="mono compact-lines"><div>↑ {{ bitrate(m.rx_bps) }}</div><div>↓ {{ bitrate(m.tx_bps) }}</div></td>
+            <td>{{ duration(m.host_uptime_secs || m.uptime_secs) }}</td>
+            <td class="mono compact-lines"><div>↑ {{ bytes(m.total_rx_bytes ?? 0) }}</div><div>↓ {{ bytes(m.total_tx_bytes ?? 0) }}</div></td>
+            <td><div class="usage-meter"><div :style="{ width: `${usage(m.cpu_percent, 100)}%` }"></div><span>{{ percent(m.cpu_percent) }}</span></div></td>
+            <td><div class="usage-meter"><div :style="{ width: `${usage(m.memory_used_bytes, m.memory_total_bytes)}%` }"></div><span>{{ m.memory_total_bytes ? percent(usage(m.memory_used_bytes, m.memory_total_bytes)) : '—' }}</span></div></td>
+            <td><div class="usage-meter"><div :style="{ width: `${usage(m.disk_used_bytes, m.disk_total_bytes)}%` }"></div><span>{{ m.disk_total_bytes ? percent(usage(m.disk_used_bytes, m.disk_total_bytes)) : '—' }}</span></div></td>
             <td style="white-space: nowrap">
-              <button class="sm" @click="openEndpointForm(m)">加隧道地址</button>
+              <button v-if="showTunnelDetails" class="sm" @click="openEndpointForm(m)">加隧道地址</button>
               <button class="sm danger" @click="removeMachine(m)">移除</button>
+              <div class="dim small">心跳 {{ ago(m.last_heartbeat_at) }}</div>
             </td>
           </tr>
           <tr v-if="!machines.length">
-            <td colspan="13" class="empty">
+            <td colspan="12" class="empty">
               组内还没有机器。点上方「一键对接」取得安装命令，在目标服务器上执行即可。
             </td>
           </tr>
@@ -298,10 +359,10 @@ function kindClass(kind: string): string {
       </table>
     </div>
 
+    <template v-if="showTunnelDetails">
     <h2>隧道地址</h2>
     <div class="banner banner-info">
-      隧道地址是**入口拨向出口时使用的地址**，属于出口机器。在同一台机器上配置
-      IEPL（主）与公网（备）两个地址，即可获得自动故障转移。
+      仅软件隧道线路需要添加出口地址。直连转发直接连接线路目标，无需配置此处。
     </div>
     <div class="table-wrap">
       <table>
@@ -374,6 +435,8 @@ function kindClass(kind: string): string {
       </table>
     </div>
 
+    </template>
+
     <h2>网卡</h2>
     <div class="table-wrap">
       <table>
@@ -393,10 +456,7 @@ function kindClass(kind: string): string {
         </tbody>
       </table>
     </div>
-    <p class="dim" style="font-size: 12px">
-      只读。agent 不会修改主机的路由或 sysctl 设置 —— IEPL 主机所需的内核配置见
-      <code>docs/networking-iepl.md</code>。
-    </p>
+    <p class="dim" style="font-size: 12px">网卡信息只读。IEPL 机器可像普通节点一样使用直连转发，目标地址由线路配置决定。</p>
 
     <h2>相关线路</h2>
     <div class="table-wrap">
@@ -499,3 +559,11 @@ function kindClass(kind: string): string {
     @close="install = null"
   />
 </template>
+
+<style scoped>
+.small { font-size: 11px; margin-top: 3px; }
+.compact-lines { white-space: nowrap; line-height: 1.6; }
+.usage-meter { position: relative; min-width: 92px; height: 24px; border-radius: 7px; background: var(--surface-3, #343944); overflow: hidden; }
+.usage-meter > div { height: 100%; background: #7061bc; opacity: .75; }
+.usage-meter > span { position: absolute; left: 8px; top: 2px; font-size: 12px; }
+</style>

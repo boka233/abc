@@ -77,6 +77,31 @@ impl<'a> StatsRepo<'a> {
             .bind(s.connections)
             .execute(&mut *tx)
             .await?;
+            if s.route_id.is_none() {
+                sqlx::query(
+                    "INSERT INTO node_traffic_totals
+                     (node_id, total_rx_bytes, total_tx_bytes, last_rx_bytes, last_tx_bytes)
+                     VALUES (?, ?, ?, ?, ?)
+                     ON CONFLICT (node_id) DO UPDATE SET
+                       total_rx_bytes = total_rx_bytes + CASE
+                         WHEN excluded.last_rx_bytes >= last_rx_bytes
+                         THEN excluded.last_rx_bytes - last_rx_bytes
+                         ELSE excluded.last_rx_bytes END,
+                       total_tx_bytes = total_tx_bytes + CASE
+                         WHEN excluded.last_tx_bytes >= last_tx_bytes
+                         THEN excluded.last_tx_bytes - last_tx_bytes
+                         ELSE excluded.last_tx_bytes END,
+                       last_rx_bytes = excluded.last_rx_bytes,
+                       last_tx_bytes = excluded.last_tx_bytes",
+                )
+                .bind(&s.node_id)
+                .bind(s.rx_bytes.max(0))
+                .bind(s.tx_bytes.max(0))
+                .bind(s.rx_bytes.max(0))
+                .bind(s.tx_bytes.max(0))
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -139,21 +164,10 @@ impl<'a> StatsRepo<'a> {
 
     /// Cumulative totals across the fleet.
     ///
-    /// Takes the newest bucket per node rather than summing every bucket:
-    /// `rx_bytes` is a cumulative counter, so summing the series would multiply
-    /// the real total by the number of samples.
+    /// The ledger adds only counter deltas and survives agent restarts and pruning.
     pub async fn lifetime_totals(&self) -> Result<(i64, i64)> {
         let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
-            "SELECT SUM(rx_bytes), SUM(tx_bytes) FROM (
-                 SELECT node_id, rx_bytes, tx_bytes
-                 FROM traffic_stats t
-                 WHERE route_id IS NULL
-                   AND bucket_at = (
-                       SELECT MAX(bucket_at) FROM traffic_stats
-                       WHERE node_id = t.node_id AND route_id IS NULL
-                   )
-                 GROUP BY node_id
-             )",
+            "SELECT SUM(total_rx_bytes), SUM(total_tx_bytes) FROM node_traffic_totals",
         )
         .fetch_optional(self.db.pool())
         .await?;
@@ -161,6 +175,16 @@ impl<'a> StatsRepo<'a> {
             Some((rx, tx)) => (rx.unwrap_or(0), tx.unwrap_or(0)),
             None => (0, 0),
         })
+    }
+
+    pub async fn node_lifetime_totals(&self, node_id: &str) -> Result<(i64, i64)> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT total_rx_bytes, total_tx_bytes FROM node_traffic_totals WHERE node_id = ?",
+        )
+        .bind(node_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(row.unwrap_or((0, 0)))
     }
 
     /// One local calendar day's traffic per route, using UTC boundaries supplied
@@ -494,6 +518,23 @@ mod tests {
     async fn lifetime_totals_on_an_empty_table_are_zero() {
         let (db, _) = fixture().await;
         assert_eq!(StatsRepo::new(&db).lifetime_totals().await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn lifetime_totals_survive_resets_and_sample_pruning() {
+        let (db, node_id) = fixture().await;
+        let repo = StatsRepo::new(&db);
+        for (rx, tx) in [(100, 200), (150, 250), (0, 0), (25, 35)] {
+            repo.record_batch(&[sample(&node_id, rx, tx)]).await.unwrap();
+        }
+        assert_eq!(repo.node_lifetime_totals(&node_id).await.unwrap(), (175, 285));
+
+        sqlx::query("UPDATE traffic_stats SET bucket_at = '2000-01-01T00:00:00+00:00'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(repo.prune(1).await.unwrap(), 4);
+        assert_eq!(repo.lifetime_totals().await.unwrap(), (175, 285));
     }
 
     #[tokio::test]

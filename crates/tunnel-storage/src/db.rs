@@ -183,6 +183,7 @@ mod tests {
             "routes",
             "route_endpoints",
             "traffic_stats",
+            "node_traffic_totals",
             "audit_logs",
             "settings",
         ] {

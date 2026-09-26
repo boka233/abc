@@ -118,6 +118,7 @@ export interface NodeDto {
   role: string
   public_address: string | null
   management_address: string | null
+  observed_ip: string | null
   agent_version: string | null
   enabled: boolean
   config_revision: number
@@ -126,9 +127,14 @@ export interface NodeDto {
   memory_used_bytes: number
   memory_total_bytes: number
   uptime_secs: number
+  host_uptime_secs: number
+  disk_used_bytes: number
+  disk_total_bytes: number
   connections: number
   rx_bytes: number
   tx_bytes: number
+  total_rx_bytes?: number
+  total_tx_bytes?: number
   rx_bps: number
   tx_bps: number
   tunnels_online: number
@@ -276,6 +282,7 @@ export interface DashboardDto {
   nodes_degraded: number
   routes_total: number
   routes_enabled: number
+  tunnel_routes_enabled: number
   tunnels_online: number
   tunnels_total: number
   connections: number

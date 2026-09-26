@@ -332,15 +332,20 @@ impl<'a> NodeRepo<'a> {
         sqlx::query(
             "INSERT INTO node_status
              (node_id, status, cpu_percent, memory_used_bytes, memory_total_bytes, uptime_secs,
+              host_uptime_secs, disk_used_bytes, disk_total_bytes, observed_ip,
               connections, rx_bytes, tx_bytes, rx_bps, tx_bps, tunnels_online, tunnels_total,
               agent_version, config_revision, interfaces_json, last_heartbeat_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (node_id) DO UPDATE SET
                status = excluded.status,
                cpu_percent = excluded.cpu_percent,
                memory_used_bytes = excluded.memory_used_bytes,
                memory_total_bytes = excluded.memory_total_bytes,
                uptime_secs = excluded.uptime_secs,
+               host_uptime_secs = excluded.host_uptime_secs,
+               disk_used_bytes = excluded.disk_used_bytes,
+               disk_total_bytes = excluded.disk_total_bytes,
+               observed_ip = COALESCE(excluded.observed_ip, observed_ip),
                connections = excluded.connections,
                rx_bytes = excluded.rx_bytes,
                tx_bytes = excluded.tx_bytes,
@@ -359,6 +364,10 @@ impl<'a> NodeRepo<'a> {
         .bind(status.memory_used_bytes)
         .bind(status.memory_total_bytes)
         .bind(status.uptime_secs)
+        .bind(status.host_uptime_secs)
+        .bind(status.disk_used_bytes)
+        .bind(status.disk_total_bytes)
+        .bind(&status.observed_ip)
         .bind(status.connections)
         .bind(status.rx_bytes)
         .bind(status.tx_bytes)
@@ -808,6 +817,10 @@ mod tests {
             node_id: node.id.clone(),
             status: "online".into(),
             cpu_percent: 12.5,
+            observed_ip: Some("203.0.113.10".into()),
+            host_uptime_secs: 7200,
+            disk_used_bytes: 25,
+            disk_total_bytes: 100,
             connections: 42,
             rx_bytes: 1000,
             tx_bytes: 2000,
@@ -822,6 +835,9 @@ mod tests {
         let dto = repo.get(&node.id).await.unwrap();
         assert_eq!(dto.status, "online");
         assert_eq!(dto.connections, 42);
+        assert_eq!(dto.observed_ip.as_deref(), Some("203.0.113.10"));
+        assert_eq!((dto.disk_used_bytes, dto.disk_total_bytes), (25, 100));
+        assert_eq!(dto.host_uptime_secs, 7200);
         assert!(dto.last_heartbeat_at.is_some());
         assert!(dto.interfaces.is_array());
 

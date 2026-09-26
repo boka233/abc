@@ -422,8 +422,6 @@ apply_tuning() {
     printf '  tcp_rmem / tcp_wmem —— 这是**每个 socket** 的上限，会按连接数倍增。\n'
     printf '    在 10000 连接下把 max 设成 16MB 理论可占 160GB 缓冲，足以触发 OOM。\n'
     printf '    仅在实测确认长肥链路吞吐受限时再调，详见 docs/linux-tuning.md。\n'
-    printf '  rp_filter —— 双网卡 IEPL 主机需要设为 2（宽松），但改错会静默丢包。\n'
-    printf '    请按 docs/networking-iepl.md 手工确认后再改。\n'
     echo
 
     if ! confirm "继续应用上述低风险参数？"; then
@@ -494,14 +492,11 @@ agent 服务已启动。注册及心跳成功后，面板「设备组」页面�
 
 ${C_BOLD}后续步骤${C_RESET}
 
-  1. 隧道 CA 与本机角色所需证书已自动安装。
+  1. 直连转发：在面板创建线路并选择「不使用隧道」。IEPL 节点也可直接转发，
+     无需添加软件隧道地址。
 
-  2. 若本机是出口，在面板设备组详情页添加「隧道地址」，
-     入口才知道该拨向哪个地址。
-
-  3. IEPL 双网卡主机：配置隧道地址之前必须先按
-     docs/networking-iepl.md 设置策略路由与 rp_filter。
-     ${C_YELLOW}未配置时的故障表现是「连接建立不起来且日志无异常」。${C_RESET}
+  2. 只有使用软件隧道线路时，出口才需在设备组详情页添加「隧道地址」。
+     所需证书已在对接时自动安装。
 
 ${C_BOLD}常用命令${C_RESET}
   systemctl status  tunnel-agent

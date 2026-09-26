@@ -43,7 +43,11 @@ export interface NodeReport {
     memory_used_bytes: number
     memory_total_bytes: number
     uptime_secs: number
+    host_uptime_secs: number
+    disk_used_bytes: number
+    disk_total_bytes: number
   }
+  interfaces: Array<{ name: string; addresses: string[]; is_loopback: boolean }>
   tunnels: TunnelDto[]
   connection_samples: ConnectionDto[]
   routes: Array<{

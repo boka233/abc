@@ -86,13 +86,17 @@ pub async fn get_group(
 
     // 逐台机器叠加实时遥测与它自己的隧道地址。
     let endpoints_repo = EndpointRepo::new(&state.db);
+    let stats_repo = tunnel_storage::stats::StatsRepo::new(&state.db);
     let mut machines = Vec::with_capacity(members.len());
     for m in &members {
         let endpoints = endpoints_repo.list_for_node(&m.id).await?;
+        let (total_rx_bytes, total_tx_bytes) = stats_repo.node_lifetime_totals(&m.id).await?;
         let live = state.report_for(&m.id).filter(|r| r.age() <= stale);
 
         let mut value = serde_json::to_value(m).unwrap_or_default();
         if let Some(obj) = value.as_object_mut() {
+            obj.insert("total_rx_bytes".into(), serde_json::json!(total_rx_bytes));
+            obj.insert("total_tx_bytes".into(), serde_json::json!(total_tx_bytes));
             obj.insert(
                 "endpoints".into(),
                 serde_json::to_value(
@@ -118,6 +122,9 @@ pub async fn get_group(
                     serde_json::json!(r.host.memory_total_bytes),
                 );
                 obj.insert("uptime_secs".into(), serde_json::json!(r.host.uptime_secs));
+                obj.insert("host_uptime_secs".into(), serde_json::json!(r.host.host_uptime_secs));
+                obj.insert("disk_used_bytes".into(), serde_json::json!(r.host.disk_used_bytes));
+                obj.insert("disk_total_bytes".into(), serde_json::json!(r.host.disk_total_bytes));
                 obj.insert(
                     "interfaces".into(),
                     serde_json::to_value(&r.interfaces).unwrap_or_default(),

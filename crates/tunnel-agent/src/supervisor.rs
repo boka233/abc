@@ -250,18 +250,34 @@ impl Supervisor {
             bundle.tls.clone()
         };
 
-        let needs_server = role.can_exit() && !bundle.listen_endpoints.is_empty();
-        let tls = TlsMaterial::load(&tls_cfg, needs_server)?;
-        self.tls.store(Some(tls.clone()));
+        let needs_server = role.can_exit()
+            && !bundle.listen_endpoints.is_empty()
+            && bundle.routes.iter().any(|r| r.enabled && r.mode.needs_tunnel()
+                && r.exit_node_id == bundle.node.id);
+        let needs_client = role.can_entry()
+            && bundle.routes.iter().any(|r| r.enabled && r.mode.needs_tunnel()
+                && r.entry_node_id == bundle.node.id);
+        let tls = if needs_server || needs_client {
+            Some(TlsMaterial::load(&tls_cfg, needs_server)?)
+        } else {
+            None
+        };
 
         let psk = bundle
             .tunnel_psk
             .clone()
             .or_else(|| self.cfg.tunnel_psk.clone());
 
+        let previous_metrics = self.runtime.read().await.route_metrics.clone();
         let mut route_metrics: HashMap<String, Arc<RouteMetrics>> = HashMap::new();
         for route in &bundle.routes {
-            route_metrics.insert(route.id.clone(), RouteMetrics::new(route.id.clone()));
+            route_metrics.insert(
+                route.id.clone(),
+                previous_metrics
+                    .get(&route.id)
+                    .cloned()
+                    .unwrap_or_else(|| RouteMetrics::new(route.id.clone())),
+            );
         }
 
         // --- entry side ---
@@ -348,7 +364,7 @@ impl Supervisor {
                         egress: EgressBinding::default(),
                     },
                     endpoints,
-                    tls.clone(),
+                    tls.clone().expect("tunnel route requires TLS"),
                     metrics.clone(),
                 )?;
 
@@ -388,7 +404,7 @@ impl Supervisor {
         if role.can_exit() {
             let mut exit_routes: HashMap<String, ExitRoute> = HashMap::new();
             for route in bundle.routes.iter().filter(|r| r.enabled) {
-                if route.exit_node_id != bundle.node.id {
+                if !route.mode.needs_tunnel() || route.exit_node_id != bundle.node.id {
                     continue;
                 }
                 let metrics = route_metrics
@@ -421,7 +437,7 @@ impl Supervisor {
                         exit_routes.clone(),
                         bundle.limits.clone(),
                         psk.clone(),
-                        tls.clone(),
+                        tls.clone().expect("tunnel listener requires TLS"),
                         self.registry.clone(),
                     ));
                     let shutdown = listener.shutdown_flag();
@@ -454,6 +470,8 @@ impl Supervisor {
             exit_listeners = exits.len(),
             "runtime built"
         );
+
+        self.tls.store(tls);
 
         Ok(Runtime {
             revision: bundle.revision,
@@ -932,6 +950,69 @@ mod tests {
         // Nothing is listening.
         assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err());
 
+        sup.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn direct_route_keeps_counters_across_disable_and_enable_without_tls() {
+        let dir = temp_dir("direct-counters");
+        let sup = Supervisor::new(agent_config(&dir));
+        let first = free_port().await;
+        let second = free_port().await;
+        let mut initial = direct_bundle(
+            1, first, vec!["127.0.0.1:9".into()], Default::default(),
+        );
+        initial.tls.ca_path = Some(dir.join("missing-ca.pem"));
+        sup.apply(&initial, false).await.unwrap();
+        {
+            let runtime = sup.runtime.read().await;
+            let counters = &runtime.route_metrics["r1"].counters;
+            counters.add_rx(100);
+            counters.add_tx(200);
+        }
+        let mut disabled = initial.clone();
+        disabled.revision = 2;
+        disabled.routes[0].enabled = false;
+        sup.apply(&disabled, false).await.unwrap();
+        assert_eq!(sup.build_report("n1").await.rx_bytes, 100);
+
+        let mut enabled = initial;
+        enabled.revision = 3;
+        enabled.routes[0].listen_port = second;
+        sup.apply(&enabled, false).await.unwrap();
+        let report = sup.build_report("n1").await;
+        assert_eq!((report.rx_bytes, report.tx_bytes), (100, 200));
+        assert_eq!(report.routes[0].rx_bytes, 100);
+        sup.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn direct_route_on_both_role_does_not_start_an_exit_listener() {
+        let dir = temp_dir("both-direct");
+        let sup = Supervisor::new(agent_config(&dir));
+        let port = free_port().await;
+        let mut config = direct_bundle(
+            1, port, vec!["127.0.0.1:9".into()], Default::default(),
+        );
+        config.node.role = NodeRole::Both;
+        config.listen_endpoints.push(Endpoint {
+            id: "e-local".into(),
+            node_id: "n1".into(),
+            name: "unused-tunnel".into(),
+            address: "127.0.0.1".into(),
+            port: free_port().await,
+            kind: EndpointKind::Public,
+            priority: EndpointPriority::Primary,
+            interface: None,
+            source_ip: None,
+            tls_server_name: None,
+            enabled: true,
+        });
+        config.tls.ca_path = Some(dir.join("missing-ca.pem"));
+        sup.apply(&config, false).await.unwrap();
+        assert!(sup.runtime.read().await.exits.is_empty());
         sup.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

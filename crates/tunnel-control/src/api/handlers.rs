@@ -217,6 +217,7 @@ pub async fn dashboard(
         "nodes_degraded": summary.nodes_degraded,
         "routes_total": routes.len(),
         "routes_enabled": routes.iter().filter(|r| r.enabled).count(),
+        "tunnel_routes_enabled": routes.iter().filter(|r| r.enabled && r.mode == "tunnel").count(),
         "tunnels_online": summary.tunnels_online,
         "tunnels_total": summary.tunnels_total,
         "connections": summary.connections,
@@ -1315,6 +1316,7 @@ pub async fn agent_config(
 pub async fn agent_heartbeat(
     State(state): State<Arc<AppState>>,
     agent: AuthAgent,
+    client: ClientAddr,
     Json(report): Json<tunnel_common::model::AgentReport>,
 ) -> ApiResult<Json<serde_json::Value>> {
     // agent 只能上报自己。少了这个检查，一台被攻破的机器就能伪造整个集群的遥测。
@@ -1334,6 +1336,10 @@ pub async fn agent_heartbeat(
         memory_used_bytes: report.host.memory_used_bytes as i64,
         memory_total_bytes: report.host.memory_total_bytes as i64,
         uptime_secs: report.host.uptime_secs as i64,
+        host_uptime_secs: report.host.host_uptime_secs as i64,
+        disk_used_bytes: report.host.disk_used_bytes as i64,
+        disk_total_bytes: report.host.disk_total_bytes as i64,
+        observed_ip: client.to_audit_string(),
         connections: report.connections as i64,
         rx_bytes: report.rx_bytes as i64,
         tx_bytes: report.tx_bytes as i64,

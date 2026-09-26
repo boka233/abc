@@ -647,6 +647,16 @@ async fn traffic_counters_reflect_real_bytes() {
     assert_eq!(got.len(), N);
 
     let counters = &dep.entry_metrics.counters;
+    // Reading the last bytes from the socket can win the race with the relay
+    // task's counter update after write_all. Wait for accounting to catch up
+    // rather than treating that scheduler timing as lost traffic.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counters.rx() < N as u64 || counters.tx() < N as u64 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("relay counters did not catch up after transfer");
     assert_eq!(counters.rx(), N as u64, "upload bytes miscounted");
     assert_eq!(counters.tx(), N as u64, "download bytes miscounted");
     assert!(counters.accepted() >= 1);

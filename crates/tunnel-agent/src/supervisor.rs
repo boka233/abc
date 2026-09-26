@@ -963,7 +963,7 @@ mod tests {
         let mut initial = direct_bundle(
             1, first, vec!["127.0.0.1:9".into()], Default::default(),
         );
-        initial.tls.ca_path = Some(dir.join("missing-ca.pem"));
+        initial.tls.ca_path = Some(dir.join("missing-ca.pem").display().to_string());
         sup.apply(&initial, false).await.unwrap();
         {
             let runtime = sup.runtime.read().await;
@@ -1010,7 +1010,7 @@ mod tests {
             tls_server_name: None,
             enabled: true,
         });
-        config.tls.ca_path = Some(dir.join("missing-ca.pem"));
+        config.tls.ca_path = Some(dir.join("missing-ca.pem").display().to_string());
         sup.apply(&config, false).await.unwrap();
         assert!(sup.runtime.read().await.exits.is_empty());
         sup.shutdown().await;

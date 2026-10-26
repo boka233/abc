@@ -284,7 +284,6 @@ impl<'a> StatsRepo<'a> {
                             ORDER BY p.bucket_at DESC, p.id DESC LIMIT 1
                         ) ELSE previous_tx END AS baseline_tx
                  FROM daily
-             )
              ), per_route AS (
                  SELECT r.id AS route_id, r.name AS route_name,
                         SUM(CASE WHEN d.baseline_rx IS NULL THEN 0

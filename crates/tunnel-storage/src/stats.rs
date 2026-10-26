@@ -285,17 +285,24 @@ impl<'a> StatsRepo<'a> {
                         ) ELSE previous_tx END AS baseline_tx
                  FROM daily
              )
-             SELECT r.id AS route_id, r.name AS route_name,
-                    SUM(CASE WHEN d.baseline_rx IS NULL THEN 0
-                             WHEN d.rx_bytes >= d.baseline_rx THEN d.rx_bytes - d.baseline_rx
-                             ELSE d.rx_bytes END) AS rx_bytes,
-                    SUM(CASE WHEN d.baseline_tx IS NULL THEN 0
-                             WHEN d.tx_bytes >= d.baseline_tx THEN d.tx_bytes - d.baseline_tx
-                             ELSE d.tx_bytes END) AS tx_bytes
-             FROM with_baseline d JOIN routes r ON r.id = d.route_id
-             GROUP BY r.id, r.name
-             HAVING rx_bytes > 0 OR tx_bytes > 0
-             ORDER BY rx_bytes + tx_bytes DESC, r.name",
+             ), per_route AS (
+                 SELECT r.id AS route_id, r.name AS route_name,
+                        SUM(CASE WHEN d.baseline_rx IS NULL THEN 0
+                                 WHEN d.rx_bytes >= d.baseline_rx THEN d.rx_bytes - d.baseline_rx
+                                 ELSE d.rx_bytes END) AS rx_bytes,
+                        SUM(CASE WHEN d.baseline_tx IS NULL THEN 0
+                                 WHEN d.tx_bytes >= d.baseline_tx THEN d.tx_bytes - d.baseline_tx
+                                 ELSE d.tx_bytes END) AS tx_bytes
+                 FROM with_baseline d JOIN routes r ON r.id = d.route_id
+                 GROUP BY r.id, r.name
+             )
+             -- 过滤必须放在聚合子查询之外。若写成 HAVING rx_bytes > 0，
+             -- SQLite 会把 rx_bytes 解析成 with_baseline 里的同名原始列而非
+             -- SUM 别名，过滤逻辑错乱，把所有线路都滤掉（当天流量恒为 0）。
+             SELECT route_id, route_name, rx_bytes, tx_bytes
+             FROM per_route
+             WHERE rx_bytes > 0 OR tx_bytes > 0
+             ORDER BY rx_bytes + tx_bytes DESC, route_name",
         )
         .bind(start_utc)
         .bind(end_utc)
@@ -688,6 +695,63 @@ mod tests {
         assert_eq!((routes[0].rx_bytes, routes[0].tx_bytes), (105, 77));
         assert_eq!(routes[1].route_id, "route-two");
         assert_eq!((routes[1].rx_bytes, routes[1].tx_bytes), (10, 20));
+    }
+
+    /// 回归：线路当天第一次上报、窗口前没有任何采样（baseline 为 NULL）时，
+    /// 当天流量必须照常统计。过滤若写成 `HAVING rx_bytes > 0`，SQLite 会把
+    /// rx_bytes 解析成底层原始列而非 SUM 别名，把有净流量的线路也滤掉，当天
+    /// 恒显示 0 —— 正是线上「不统计今天已用流量」的现象。
+    #[tokio::test]
+    async fn daily_routes_count_a_routes_very_first_day() {
+        let (db, node_id) = fixture().await;
+        let (group_id,): (String,) = sqlx::query_as("SELECT group_id FROM nodes WHERE id = ?")
+            .bind(&node_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO routes
+             (id, name, entry_group_id, exit_group_id, listen_address, listen_port,
+              target_host, target_port, mode, created_at, updated_at)
+             VALUES ('route-new', 'route-new', ?, ?, '0.0.0.0', 5001, '127.0.0.1', 443,
+                     'direct', ?, ?)",
+        )
+        .bind(&group_id)
+        .bind(&group_id)
+        .bind(now_string())
+        .bind(now_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // 全部采样都落在窗口内，窗口之前没有任何一行 —— 首行 baseline 为 NULL。
+        for (at, rx, tx) in [
+            ("2026-09-25T16:00:10+00:00", 1_000, 2_000),
+            ("2026-09-25T16:05:20+00:00", 1_500, 2_600),
+            ("2026-09-25T16:10:30+00:00", 4_000, 9_000),
+        ] {
+            sqlx::query(
+                "INSERT INTO traffic_stats
+                 (bucket_at, node_id, route_id, rx_bytes, tx_bytes)
+                 VALUES (?, ?, 'route-new', ?, ?)",
+            )
+            .bind(at)
+            .bind(&node_id)
+            .bind(rx)
+            .bind(tx)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let routes = StatsRepo::new(&db)
+            .daily_routes("2026-09-25T16:00:00+00:00", "2026-09-26T16:00:00+00:00")
+            .await
+            .unwrap();
+        // 首行作基线（贡献 0），后续两段增量 500+2500=3000 / 600+6400=7000。
+        assert_eq!(routes.len(), 1, "有净流量的线路必须出现，不能被过滤掉");
+        assert_eq!(routes[0].route_id, "route-new");
+        assert_eq!((routes[0].rx_bytes, routes[0].tx_bytes), (3_000, 7_000));
     }
 
     /// 一个组、两台入口机、一条直连线路。返回 (db, 机器 a, 机器 b, 线路 id)。
